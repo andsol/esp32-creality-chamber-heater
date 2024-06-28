@@ -1,28 +1,27 @@
 #include <Arduino.h>
+#include "esp_timer.h"
+#include <SPI.h>
+#include "I2CScanner.h"
 #include <Wire.h>
-#include <Adafruit_SSD1306.h>
-#include <DHT20.h>
+#include <LiquidTWI2.h>
+#include <DFRobot_DHT20.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#include <WiFiManager.h>
 #include <Preferences.h>
 #include <ArduinoWebsockets.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 
-// OLED display settings
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-#define SSD1306_I2C_ADDRESS 0x3C
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+I2CScanner scanner;
 
 // PWM settings
-#define HEATER_PIN 16  // GPIO pin for heater control
-#define FAN_PIN 17     // GPIO pin for fan control
+#define HEATER_PIN 16  //GPIO pin for heater control
+#define FAN_PIN 23     // GPIO pin for fan control
 #define TACH_PIN 18    // GPIO pin for tachometer input
 #define PWM_FREQ 25000 // 25 kHz frequency for Noctua fan
 #define PWM_RESOLUTION 8 // 8-bit resolution
+#define PWM_HEATER_LIMIT 200 // Do not reach 100%
 
 // Web server
 WebServer server(80);
@@ -32,9 +31,10 @@ Preferences preferences;
 
 websockets::WebsocketsClient webSocket; // Use the ArduinoWebsockets client
 
-DHT20 dht(&Wire1); // Initialize the DHT20 object
+DFRobot_DHT20 dht(&Wire); // Initialize the DHT20 object
 
 float targetTemperature = 25.0; // Default target temperature
+const float fullLoadThreshold = 5.0; // Temperature threshold for full load
 float currentTemperature = 0.0;
 float currentHumidity = 0.0;
 float chamberTemperature = 0.0;
@@ -42,6 +42,8 @@ int fanSpeed = 0;
 volatile unsigned long tachCount = 0;
 unsigned long lastTachTime = 0;
 int fanRPM = 0;
+bool isFanRunning = false; // Fan state
+unsigned long fanStopTime = 0; // Time when the fan should stop
 
 String moonrakerIp = "";
 String moonrakerAuth = "";
@@ -52,27 +54,19 @@ const unsigned long connectionInterval = 10000; // 10 seconds
 
 bool waitingForTemperature = false;
 bool useDHT20 = true; // Flag to switch between DHT20 and Moonraker
+bool manualMode = false; // Flag to switch between DHT20 and Moonraker
 
-// WiFi and 3D printer icons
-#define WIFI_ICON_WIDTH 16
-#define WIFI_ICON_HEIGHT 16
-static const unsigned char PROGMEM wifi_icon[] = {
-  0x00, 0x00, 0x03, 0xc0, 0x07, 0xe0, 0x0c, 0x30, 0x18, 0x18, 0x30, 0x0c, 0x63, 0xe6, 0xc6, 0x73, 
-  0x8c, 0x31, 0x18, 0x18, 0x30, 0x0c, 0x60, 0x06, 0xc0, 0x03, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00 
-};
-
-#define PRINTER_ICON_WIDTH 16
-#define PRINTER_ICON_HEIGHT 16
-static const unsigned char PROGMEM printer_icon[] = {
-  0x3c, 0x3c, 0x7e, 0x7e, 0x66, 0x66, 0xc3, 0xc3, 0x81, 0x81, 0x99, 0x99, 0xbd, 0xbd, 0xff, 0xff, 
-  0x81, 0x81, 0xbd, 0xbd, 0xbd, 0xbd, 0x99, 0x99, 0x81, 0x81, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00 
-};
+#define TIMER_INTERVAL_SEC 20 // 20 seconds
+String topText = "";
+String bottomText = "";
+LiquidTWI2 display(0x20);
 
 // Function declarations
 void handleRoot();
 void handleSetTargetTemp();
 void handleSetMoonrakerConfig();
 void handleSetTemperatureSource();
+void handleSetManualMode();
 void updatePWM();
 void updateDisplay();
 void IRAM_ATTR handleTach();
@@ -85,21 +79,43 @@ void subscribeMoonraker();
 void attemptConnection();
 void sendContinueCommand();
 
+
+// Display update limiter
+bool canUpdateDisplay = true;
+esp_timer_handle_t timer;
+
+void IRAM_ATTR resetDisplayTimerCallback(void* arg) {
+  canUpdateDisplay = true;
+}
+
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
 
-  // Initialize the DHT20 sensor
-  dht.begin();
-
-  // Initialize the OLED display
-  if (!display.begin(SSD1306_I2C_ADDRESS, OLED_RESET)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);
+  if (Wire.begin()) {
+    Serial.println("I2C Started");
+  } else {
+    Serial.println(F("I2C Not Started"));
   }
-  display.display();
-  delay(2000);
-  display.clearDisplay();
+
+  // Initialize the DHT20 sensor
+  while(dht.begin()){
+    Serial.println("Initialize sensor failed");
+    delay(1000);
+  }
+
+  Serial.print("Temperature: ");
+  Serial.print(dht.getTemperature());
+  Serial.println(" *C");
+
+  scanner.Init();
+  scanner.Scan();
+
+  display.setMCPType(LTI_TYPE_MCP23008);
+  display.begin(16, 2);
+  // Print a message to the LCD.
+  display.print("Boot...");
+  display.setBacklight(HIGH);
 
   // Initialize WiFi using WiFiManager
   WiFiManager wifiManager;
@@ -113,12 +129,15 @@ void setup() {
   moonrakerIp = preferences.getString("ip", "");
   moonrakerAuth = preferences.getString("auth", "");
   useDHT20 = preferences.getBool("useDHT20", true);
+  manualMode = preferences.getBool("manualMode", false);
 
   // Initialize the web server
   server.on("/", handleRoot);
   server.on("/setTargetTemp", handleSetTargetTemp);
   server.on("/setMoonrakerConfig", handleSetMoonrakerConfig);
   server.on("/setTemperatureSource", handleSetTemperatureSource);
+  server.on("/setManualMode",   handleSetManualMode);
+
   server.begin();
   Serial.println("HTTP server started");
 
@@ -135,8 +154,13 @@ void setup() {
   // Attempt initial connection to WebSocket
   attemptConnection();
 
-  // Update display and PWM initially
-  updateDisplay();
+  // Create the timer
+  const esp_timer_create_args_t timerArgs = {
+    .callback = &resetDisplayTimerCallback,
+    .name = "reset_timer"
+  };
+  esp_timer_create(&timerArgs, &timer);
+
   updatePWM();
 }
 
@@ -159,7 +183,6 @@ void loop() {
 
   // Read current temperature and humidity from DHT20
   if (useDHT20) {
-    dht.read(); // Read values from DHT20
     currentTemperature = dht.getTemperature();
     currentHumidity = dht.getHumidity();
   }
@@ -181,21 +204,27 @@ void loop() {
   }
 
   // Update the OLED display
-  updateDisplay();
+  if (canUpdateDisplay) {
+    updateDisplay();
+    canUpdateDisplay = false;
+    // Start the timer to reset canExecuteFunction after 20 seconds
+    esp_timer_start_once(timer, TIMER_INTERVAL_SEC * 1000000);
+  }
 
   // Add a small delay to avoid reading too frequently
   delay(2000);
 }
 
 void handleRoot() {
-  String html = "<html><body>";
-  html += "<h1>ESP32 PWM Heater Control</h1>";
+  String html = "<html><head><link rel=\"stylesheet\" href=\"https://cdn.simplecss.org/simple.min.css\"></head><body>";
+  html += "<header><h1>Moonraker chamber Heater Control</h1>";
   html += "<p>Current Temperature: " + String(currentTemperature) + " &deg;C</p>";
   html += "<p>Current Humidity: " + String(currentHumidity) + " %</p>";
   html += "<p>Target Temperature: " + String(targetTemperature) + " &deg;C</p>";
   html += "<p>Chamber Temperature: " + String(chamberTemperature) + " &deg;C</p>";
-  html += "<form action=\"/setTargetTemp\" method=\"POST\">";
-  html += "Set Target Temperature: <input type=\"text\" name=\"targetTemp\">";
+  html += "</header>";
+  html += "<main><form action=\"/setTargetTemp\" method=\"POST\">";
+  html += "Set Target Temperature: <input type=\"text\" name=\"targetTemp\"><br>";
   html += "<input type=\"submit\" value=\"Set\">";
   html += "</form>";
   html += "<h2>Moonraker Configuration</h2>";
@@ -210,6 +239,12 @@ void handleRoot() {
   html += "Use Moonraker API: <input type=\"radio\" name=\"source\" value=\"Moonraker\" " + String(!useDHT20 ? "checked" : "") + "><br>";
   html += "<input type=\"submit\" value=\"Set\">";
   html += "</form>";
+  html += "<h2>Manual mode</h2>";
+  html += "<form action=\"/setManualMode\" method=\"POST\">";
+  html += "Manual: <input type=\"radio\" name=\"mode\" value=\"Yes\" " + String(manualMode ? "checked" : "") + "><br>";
+  html += "Use Moonraker API: <input type=\"radio\" name=\"mode\" value=\"No\" " + String(!manualMode ? "checked" : "") + "><br>";
+  html += "<input type=\"submit\" value=\"Set\">";
+  html += "</form></main>";
   html += "</body></html>";
 
   server.send(200, "text/html", html);
@@ -238,6 +273,17 @@ void handleSetMoonrakerConfig() {
   server.send(303);
 }
 
+void handleSetManualMode() {
+  if (server.hasArg("mode")) {
+    String mode = server.arg("mode");
+    manualMode = (mode == "Yes");
+    preferences.putBool("manualMode", manualMode);
+    Serial.println("Manual mode: " + String(manualMode ? "Yes" : "No"));
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
 void handleSetTemperatureSource() {
   if (server.hasArg("source")) {
     String source = server.arg("source");
@@ -250,74 +296,122 @@ void handleSetTemperatureSource() {
 }
 
 void updatePWM() {
-  // Calculate the PWM value for the heater
-  int heaterPWM = map(currentTemperature, 0, targetTemperature, 255, 0);
-  heaterPWM = constrain(heaterPWM, 0, 255);
-  if (isPrinting) {
-    ledcWrite(0, heaterPWM);
+  // Heating and fan control logic
+  if (isPrinting || manualMode) {
+    if (currentTemperature < targetTemperature) {
+      fanStopTime = 0; // Reset fan stop time
+      if (currentTemperature < targetTemperature - fullLoadThreshold) {
+        // Temperature is much lower than target, full load
+        ledcWrite(0, PWM_HEATER_LIMIT);
+        ledcWrite(1, 255);
+        isFanRunning = true;
+      } else {
+        // Temperature is closer to target, reduce heater power
+        float pwmValue = 255 * (targetTemperature - currentTemperature) / fullLoadThreshold;
+        pwmValue = constrain((int)pwmValue, 0, PWM_HEATER_LIMIT);
+        ledcWrite(0, pwmValue);
+        ledcWrite(1, 255);
+        isFanRunning = true;
+      }
+    } else {
+      // Target temperature reached, turn off heater and fan
+      ledcWrite(0, 0);
+      if (isFanRunning) {
+        // Set the time when the fan should stop
+        if (fanStopTime == 0) {
+          fanStopTime = millis();
+        }
+        // Check if 30 seconds have passed
+        if (millis() - fanStopTime >= 30000) {
+          ledcWrite(1, 0);
+          isFanRunning = false;
+        } else {
+          // Half speed
+          ledcWrite(1, 128);
+        }
+      }
+    }
   } else {
     ledcWrite(0, 0);
-  }
-
-  // Calculate the PWM value for the fan
-  fanSpeed = map(currentTemperature, targetTemperature, targetTemperature + 10, 0, 255);
-  fanSpeed = constrain(fanSpeed, 0, 255);
-  if (isPrinting) {
-    ledcWrite(1, fanSpeed);
-  } else {
     ledcWrite(1, 0);
   }
 }
 
 void updateDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+
+  topText = "";
+  bottomText = "";
 
   // Draw WiFi icon if connected
   if (WiFi.status() == WL_CONNECTED) {
-    display.drawBitmap(0, 0, wifi_icon, WIFI_ICON_WIDTH, WIFI_ICON_HEIGHT, SSD1306_WHITE);
+    //display.drawBitmap(0, 0, wifi_icon, WIFI_ICON_WIDTH, WIFI_ICON_HEIGHT, SSD1306_WHITE);
   }
+
+  topText += "Wifi:";
+  topText += WiFi.status() == WL_CONNECTED ? "Yes" : "No";
+  topText += " ";
 
   // Draw 3D printer icon if connected to Moonraker
   if (webSocket.available()) {
-    display.drawBitmap(20, 0, printer_icon, PRINTER_ICON_WIDTH, PRINTER_ICON_HEIGHT, SSD1306_WHITE);
+    //display.drawBitmap(20, 0, printer_icon, PRINTER_ICON_WIDTH, PRINTER_ICON_HEIGHT, SSD1306_WHITE);
   }
 
-  display.setCursor(40, 0);
-  display.print("Current Temp: ");
-  display.print(currentTemperature);
-  display.print(" C");
+  topText += "MoonR:";
+  topText += webSocket.available() ? "Yes" : "No";
+  topText += " ";
 
-  display.setCursor(40, 10);
-  display.print("Target Temp: ");
-  display.print(targetTemperature);
-  display.print(" C");
+  topText += "CurrT:";
+  topText += currentTemperature;
+  topText += " ";
 
-  display.setCursor(40, 20);
-  display.print("Humidity: ");
-  display.print(currentHumidity);
-  display.print(" %");
+  topText += "TargetT:";
+  topText += targetTemperature;
+  topText += " ";
 
-  display.setCursor(40, 30);
-  display.print("Fan Speed: ");
-  display.print(fanSpeed);
-  display.print(" %");
+  topText += "Humid:";
+  topText += currentHumidity;
+  topText += "% ";
 
-  display.setCursor(40, 40);
-  display.print("Fan RPM: ");
-  display.print(fanRPM);
+  bottomText += "FanSp:";
+  bottomText += fanSpeed;
+  bottomText += " ";
 
-  display.setCursor(40, 50);
-  display.print("Chamber Temp: ");
-  display.print(chamberTemperature);
-  display.print(" C");
+  bottomText += "FanRpm:";
+  bottomText += fanRPM;
+  bottomText += " ";
 
-  display.setCursor(40, 60);
-  display.print("Printing: ");
-  display.print(isPrinting ? "Yes" : "No");
+  bottomText += "CamberT:";
+  bottomText += chamberTemperature;
+  bottomText += " ";
 
-  display.display();
+  bottomText += ("Printing: ");
+  bottomText += isPrinting ? "Yes" : "No";
+
+  int topTextLen = topText.length();
+  int bottomTextLen = bottomText.length();
+  int maxScroll = max(topTextLen, bottomTextLen);
+
+  for (int i = 0; i < maxScroll - 16; i++) {
+    display.clear();
+    display.setCursor(0, 0);
+    for (int j = 0; j < 16; j++) {
+      if (i + j < topTextLen) {
+        display.print(topText[i + j]);
+      } else {
+        display.print(' ');
+      }
+    }
+
+    display.setCursor(0, 1);
+    for (int s = 0; s < 16; s++) {
+      if (i + s < bottomTextLen) {
+        display.print(bottomText[i + s]);
+      } else {
+        display.print(' ');
+      }
+    }
+    delay(500);
+  }
 }
 
 void IRAM_ATTR handleTach() {
@@ -326,7 +420,7 @@ void IRAM_ATTR handleTach() {
 
 void onMessageCallback(websockets::WebsocketsMessage message) {
   Serial.printf("Received: %s\n", message.data());
-  StaticJsonDocument<1024> doc;
+  JsonDocument doc;
   deserializeJson(doc, message.data());
   if (doc.containsKey("event")) {
     String event = doc["event"].as<String>();
@@ -342,7 +436,7 @@ void onMessageCallback(websockets::WebsocketsMessage message) {
 
         if (httpResponseCode == 200) {
           String payload = http.getString();
-          StaticJsonDocument<200> doc;
+          JsonDocument doc;
           deserializeJson(doc, payload);
           targetTemperature = doc["result"]["target_temperature"].as<float>();
           Serial.println("Target Temperature: " + String(targetTemperature));
