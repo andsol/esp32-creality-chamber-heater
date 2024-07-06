@@ -1,8 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include "I2CScanner.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include "SSD1306Wire.h"
 #include <DHT20.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -15,11 +14,8 @@
 I2CScanner scanner;
 
 // OLED display settings
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-#define SSD1306_I2C_ADDRESS 0x3C
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#define I2C_ADDRESS 0x3C
+SSD1306Wire display(I2C_ADDRESS, SDA, SCL);
 
 // PWM settings
 #define HEATER_PIN 16  // GPIO pin for heater control
@@ -63,18 +59,24 @@ bool useDHT20 = true; // Flag to switch between DHT20 and Moonraker
 bool manualMode = false; // Flag to switch between DHT20 and Moonraker
 
 // WiFi and 3D printer icons
-#define WIFI_ICON_WIDTH 16
-#define WIFI_ICON_HEIGHT 16
+#define ICON_WIDTH 16
+#define ICON_HEIGHT 16
 static const unsigned char PROGMEM wifi_icon[] = {
-  0x00, 0x00, 0x03, 0xc0, 0x07, 0xe0, 0x0c, 0x30, 0x18, 0x18, 0x30, 0x0c, 0x63, 0xe6, 0xc6, 0x73, 
-  0x8c, 0x31, 0x18, 0x18, 0x30, 0x0c, 0x60, 0x06, 0xc0, 0x03, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00 
+  0x00,0x00,0x00,0x00,0xc0,0x07,0xf8,0x3f,0xfc,0x7f,0x1c,0x70,0x00,0x01,0xe0,
+0x0f,0xf0,0x1f,0x60,0x0c,0x00,0x00,0x80,0x03,0xc0,0x07,0xc0,0x07,0x80,0x03,
+0x00,0x00
 };
 
-#define PRINTER_ICON_WIDTH 16
-#define PRINTER_ICON_HEIGHT 16
 static const unsigned char PROGMEM printer_icon[] = {
-  0x3c, 0x3c, 0x7e, 0x7e, 0x66, 0x66, 0xc3, 0xc3, 0x81, 0x81, 0x99, 0x99, 0xbd, 0xbd, 0xff, 0xff, 
-  0x81, 0x81, 0xbd, 0xbd, 0xbd, 0xbd, 0x99, 0x99, 0x81, 0x81, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00 
+  0x00,0x00,0x00,0x02,0x00,0x07,0x00,0x0f,0x40,0x1e,0xe0,0x3c,0xf0,0x79,0xf8,
+0x73,0xec,0x27,0xc4,0x0f,0x8c,0x07,0x1c,0x03,0xbc,0x01,0xfc,0x00,0x00,0x00,
+0x00,0x00
+};
+
+static const unsigned char PROGMEM printing_icon[] = {
+  0xc0,0x01,0xc0,0x01,0xc0,0x01,0xc0,0x01,0xc0,0x01,0xfc,0x1f,0xf8,0x0f,0xe0,
+0x03,0xc3,0x61,0x83,0x60,0x03,0x60,0x03,0x60,0x07,0x70,0xfe,0x3f,0xfc,0x1f,
+0x00,0x00
 };
 
 // Function declarations
@@ -107,18 +109,9 @@ void setup() {
   dht.begin();
 
   // Initialize the OLED display
-  if (!display.begin(SSD1306_I2C_ADDRESS, OLED_RESET)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);
-  }
-  display.display();
-  delay(2000);
-  display.clearDisplay();
-
-  display.invertDisplay(true);
-  delay(1000);
-  display.invertDisplay(false);
-  delay(1000);
+  display.init();
+  display.displayOn(); 
+  display.resetDisplay();
 
   // Initialize WiFi using WiFiManager
   WiFiManager wifiManager;
@@ -331,52 +324,52 @@ void updatePWM() {
 }
 
 void updateDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
 
   // Draw WiFi icon if connected
   if (WiFi.status() == WL_CONNECTED) {
-    display.drawBitmap(0, 0, wifi_icon, WIFI_ICON_WIDTH, WIFI_ICON_HEIGHT, SSD1306_WHITE);
+    display.drawXbm(0, 0, ICON_WIDTH, ICON_HEIGHT, wifi_icon);
   }
 
   // Draw 3D printer icon if connected to Moonraker
-  if (webSocket.available()) {
-    display.drawBitmap(20, 0, printer_icon, PRINTER_ICON_WIDTH, PRINTER_ICON_HEIGHT, SSD1306_WHITE);
-  }
+  //if (webSocket.available()) {
+    display.drawXbm(0, 20, ICON_WIDTH, ICON_HEIGHT, printer_icon);
+  //}
 
-  display.setCursor(40, 0);
-  display.print("Current Temp: ");
-  display.print(currentTemperature);
-  display.print(" C");
+  //if (isPrinting) {
+    display.drawXbm(0, 40, ICON_WIDTH, ICON_HEIGHT, printing_icon);
+  //}
 
-  display.setCursor(40, 10);
-  display.print("Target Temp: ");
-  display.print(targetTemperature);
-  display.print(" C");
+  String temp = "Current Temp: ";
+  temp += currentTemperature;
+  temp += " C";
+  display.drawString(20, 0, temp);
 
-  display.setCursor(40, 20);
-  display.print("Humidity: ");
-  display.print(currentHumidity);
-  display.print(" %");
+  String targetTemp = "Target Temp: ";
+  targetTemp += targetTemperature;
+  targetTemp += " C";
+  display.drawString(20, 10, targetTemp);
 
-  display.setCursor(40, 30);
-  display.print("Fan Speed: ");
-  display.print(fanSpeed);
-  display.print(" %");
+  String humidity = "Humidity: ";
+  humidity += currentHumidity;
+  humidity += " %";
+  display.drawString(20, 20, humidity);
 
-  display.setCursor(40, 40);
-  display.print("Fan RPM: ");
-  display.print(fanRPM);
+  String fanSpeedText = "Fan Speed: ";
+  fanSpeedText += fanSpeed;
+  fanSpeedText += " %";
+  display.drawString(20, 30, fanSpeedText);
 
-  display.setCursor(40, 50);
-  display.print("Chamber Temp: ");
-  display.print(chamberTemperature);
-  display.print(" C");
+  String fanRpmText = "Fan RPM: ";
+  fanRpmText += fanRPM;
+  fanRpmText += " rpm";
+  display.drawString(20, 40, fanRpmText);
 
-  display.setCursor(40, 60);
-  display.print("Printing: ");
-  display.print(isPrinting ? "Yes" : "No");
+  String chambTempText = "Chamber Temp: ";
+  chambTempText += chamberTemperature;
+  chambTempText += " C";
+  display.drawString(20, 50, chambTempText);
 
   display.display();
 }
