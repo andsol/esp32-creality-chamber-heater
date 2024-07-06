@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "I2CScanner.h"
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <DHT20.h>
@@ -35,6 +36,7 @@ websockets::WebsocketsClient webSocket; // Use the ArduinoWebsockets client
 DHT20 dht(&Wire); // Initialize the DHT20 object
 
 float targetTemperature = 25.0; // Default target temperature
+const float fullLoadThreshold = 5.0; // Temperature threshold for full load
 float currentTemperature = 0.0;
 float currentHumidity = 0.0;
 float chamberTemperature = 0.0;
@@ -42,6 +44,8 @@ int fanSpeed = 0;
 volatile unsigned long tachCount = 0;
 unsigned long lastTachTime = 0;
 int fanRPM = 0;
+bool isFanRunning = false; // Fan state
+unsigned long fanStopTime = 0; // Time when the fan should stop
 
 String moonrakerIp = "";
 String moonrakerAuth = "";
@@ -52,6 +56,7 @@ const unsigned long connectionInterval = 10000; // 10 seconds
 
 bool waitingForTemperature = false;
 bool useDHT20 = true; // Flag to switch between DHT20 and Moonraker
+bool manualMode = false; // Flag to switch between DHT20 and Moonraker
 
 // WiFi and 3D printer icons
 #define WIFI_ICON_WIDTH 16
@@ -71,6 +76,7 @@ static const unsigned char PROGMEM printer_icon[] = {
 // Function declarations
 void handleRoot();
 void handleSetTargetTemp();
+void handleSetManualMode();
 void handleSetMoonrakerConfig();
 void handleSetTemperatureSource();
 void updatePWM();
@@ -113,6 +119,7 @@ void setup() {
   moonrakerIp = preferences.getString("ip", "");
   moonrakerAuth = preferences.getString("auth", "");
   useDHT20 = preferences.getBool("useDHT20", true);
+  manualMode = preferences.getBool("manualMode", false);
 
   // Initialize the web server
   server.on("/", handleRoot);
@@ -127,6 +134,7 @@ void setup() {
   ledcAttachPin(HEATER_PIN, 0);
   ledcSetup(1, PWM_FREQ, PWM_RESOLUTION); // 25 kHz PWM, 8-bit resolution
   ledcAttachPin(FAN_PIN, 1);
+  
 
   // Initialize tachometer input
   pinMode(TACH_PIN, INPUT_PULLUP);
@@ -188,14 +196,15 @@ void loop() {
 }
 
 void handleRoot() {
-  String html = "<html><body>";
-  html += "<h1>ESP32 PWM Heater Control</h1>";
+  String html = "<html><head><link rel=\"stylesheet\" href=\"https://cdn.simplecss.org/simple.min.css\"></head><body>";
+  html += "<header><h1>Moonraker chamber Heater Control</h1>";
   html += "<p>Current Temperature: " + String(currentTemperature) + " &deg;C</p>";
   html += "<p>Current Humidity: " + String(currentHumidity) + " %</p>";
   html += "<p>Target Temperature: " + String(targetTemperature) + " &deg;C</p>";
   html += "<p>Chamber Temperature: " + String(chamberTemperature) + " &deg;C</p>";
-  html += "<form action=\"/setTargetTemp\" method=\"POST\">";
-  html += "Set Target Temperature: <input type=\"text\" name=\"targetTemp\">";
+  html += "</header>";
+  html += "<main><form action=\"/setTargetTemp\" method=\"POST\">";
+  html += "Set Target Temperature: <input type=\"text\" name=\"targetTemp\"><br>";
   html += "<input type=\"submit\" value=\"Set\">";
   html += "</form>";
   html += "<h2>Moonraker Configuration</h2>";
@@ -210,6 +219,12 @@ void handleRoot() {
   html += "Use Moonraker API: <input type=\"radio\" name=\"source\" value=\"Moonraker\" " + String(!useDHT20 ? "checked" : "") + "><br>";
   html += "<input type=\"submit\" value=\"Set\">";
   html += "</form>";
+  html += "<h2>Manual mode</h2>";
+  html += "<form action=\"/setManualMode\" method=\"POST\">";
+  html += "Manual: <input type=\"radio\" name=\"mode\" value=\"Yes\" " + String(manualMode ? "checked" : "") + "><br>";
+  html += "Use Moonraker API: <input type=\"radio\" name=\"mode\" value=\"No\" " + String(!manualMode ? "checked" : "") + "><br>";
+  html += "<input type=\"submit\" value=\"Set\">";
+  html += "</form></main>";
   html += "</body></html>";
 
   server.send(200, "text/html", html);
@@ -244,6 +259,17 @@ void handleSetTemperatureSource() {
     useDHT20 = (source == "DHT20");
     preferences.putBool("useDHT20", useDHT20);
     Serial.println("Temperature source set to: " + String(useDHT20 ? "DHT20" : "Moonraker"));
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSetManualMode() {
+  if (server.hasArg("mode")) {
+    String mode = server.arg("mode");
+    manualMode = (mode == "Yes");
+    preferences.putBool("manualMode", manualMode);
+    Serial.println("Manual mode: " + String(manualMode ? "Yes" : "No"));
   }
   server.sendHeader("Location", "/");
   server.send(303);
