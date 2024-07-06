@@ -19,8 +19,8 @@ SSD1306Wire display(I2C_ADDRESS, SDA, SCL);
 
 // PWM settings
 #define HEATER_PIN 16  // GPIO pin for heater control
-#define FAN_PIN 18    // GPIO pin for fan control
-#define TACH_PIN 23    // GPIO pin for tachometer input
+#define FAN_PIN 23    // GPIO pin for fan control
+#define TACH_PIN 18    // GPIO pin for tachometer input
 #define PWM_FREQ 25000 // 25 kHz frequency for Noctua fan
 #define PWM_RESOLUTION 8 // 8-bit resolution
 #define PWM_HEATER_LIMIT 200
@@ -333,13 +333,13 @@ void updateDisplay() {
   }
 
   // Draw 3D printer icon if connected to Moonraker
-  //if (webSocket.available()) {
+  if (webSocket.available()) {
     display.drawXbm(0, 20, ICON_WIDTH, ICON_HEIGHT, printer_icon);
-  //}
+  }
 
-  //if (isPrinting) {
+  if (isPrinting) {
     display.drawXbm(0, 40, ICON_WIDTH, ICON_HEIGHT, printing_icon);
-  //}
+  }
 
   String temp = "Current Temp: ";
   temp += currentTemperature;
