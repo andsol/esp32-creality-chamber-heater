@@ -1,15 +1,18 @@
 #include <Arduino.h>
-#include "I2CScanner.h"
 #include <Wire.h>
+#include "I2CScanner.h"
+#include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <DHT20.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#include <WiFiManager.h>
 #include <Preferences.h>
 #include <ArduinoWebsockets.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+
+I2CScanner scanner;
 
 // OLED display settings
 #define SCREEN_WIDTH 128
@@ -24,6 +27,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define TACH_PIN 23    // GPIO pin for tachometer input
 #define PWM_FREQ 25000 // 25 kHz frequency for Noctua fan
 #define PWM_RESOLUTION 8 // 8-bit resolution
+#define PWM_HEATER_LIMIT 200
 
 // Web server
 WebServer server(80);
@@ -94,6 +98,10 @@ void sendContinueCommand();
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
+  Wire.begin(SDA, SCL);
+
+  scanner.Init();
+  scanner.Scan();
 
   // Initialize the DHT20 sensor
   dht.begin();
@@ -106,6 +114,11 @@ void setup() {
   display.display();
   delay(2000);
   display.clearDisplay();
+
+  display.invertDisplay(true);
+  delay(1000);
+  display.invertDisplay(false);
+  delay(1000);
 
   // Initialize WiFi using WiFiManager
   WiFiManager wifiManager;
@@ -276,21 +289,43 @@ void handleSetManualMode() {
 }
 
 void updatePWM() {
-  // Calculate the PWM value for the heater
-  int heaterPWM = map(currentTemperature, 0, targetTemperature, 255, 0);
-  heaterPWM = constrain(heaterPWM, 0, 255);
-  if (isPrinting) {
-    ledcWrite(0, heaterPWM);
+  // Heating and fan control logic
+  if (isPrinting || manualMode) {
+    if (currentTemperature < targetTemperature) {
+      fanStopTime = 0; // Reset fan stop time
+      if (currentTemperature < targetTemperature - fullLoadThreshold) {
+        // Temperature is much lower than target, full load
+        ledcWrite(0, PWM_HEATER_LIMIT);
+        ledcWrite(1, 255);
+        isFanRunning = true;
+      } else {
+        // Temperature is closer to target, reduce heater power
+        float pwmValue = 255 * (targetTemperature - currentTemperature) / fullLoadThreshold;
+        pwmValue = constrain((int)pwmValue, 0, PWM_HEATER_LIMIT);
+        ledcWrite(0, pwmValue);
+        ledcWrite(1, 255);
+        isFanRunning = true;
+      }
+    } else {
+      // Target temperature reached, turn off heater and fan
+      ledcWrite(0, 0);
+      if (isFanRunning) {
+        // Set the time when the fan should stop
+        if (fanStopTime == 0) {
+          fanStopTime = millis();
+        }
+        // Check if 30 seconds have passed
+        if (millis() - fanStopTime >= 30000) {
+          ledcWrite(1, 0);
+          isFanRunning = false;
+        } else {
+          // Half speed
+          ledcWrite(1, 128);
+        }
+      }
+    }
   } else {
     ledcWrite(0, 0);
-  }
-
-  // Calculate the PWM value for the fan
-  fanSpeed = map(currentTemperature, targetTemperature, targetTemperature + 10, 0, 255);
-  fanSpeed = constrain(fanSpeed, 0, 255);
-  if (isPrinting) {
-    ledcWrite(1, fanSpeed);
-  } else {
     ledcWrite(1, 0);
   }
 }
@@ -352,7 +387,7 @@ void IRAM_ATTR handleTach() {
 
 void onMessageCallback(websockets::WebsocketsMessage message) {
   Serial.printf("Received: %s\n", message.data());
-  StaticJsonDocument<1024> doc;
+  JsonDocument doc;
   deserializeJson(doc, message.data());
   if (doc.containsKey("event")) {
     String event = doc["event"].as<String>();
@@ -368,7 +403,7 @@ void onMessageCallback(websockets::WebsocketsMessage message) {
 
         if (httpResponseCode == 200) {
           String payload = http.getString();
-          StaticJsonDocument<200> doc;
+          JsonDocument doc;
           deserializeJson(doc, payload);
           targetTemperature = doc["result"]["target_temperature"].as<float>();
           Serial.println("Target Temperature: " + String(targetTemperature));
