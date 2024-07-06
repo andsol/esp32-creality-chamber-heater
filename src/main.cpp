@@ -19,8 +19,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // PWM settings
 #define HEATER_PIN 16  // GPIO pin for heater control
-#define FAN_PIN 17     // GPIO pin for fan control
-#define TACH_PIN 18    // GPIO pin for tachometer input
+#define FAN_PIN 18    // GPIO pin for fan control
+#define TACH_PIN 23    // GPIO pin for tachometer input
 #define PWM_FREQ 25000 // 25 kHz frequency for Noctua fan
 #define PWM_RESOLUTION 8 // 8-bit resolution
 
@@ -32,7 +32,7 @@ Preferences preferences;
 
 websockets::WebsocketsClient webSocket; // Use the ArduinoWebsockets client
 
-DHT20 dht(&Wire1); // Initialize the DHT20 object
+DHT20 dht(&Wire); // Initialize the DHT20 object
 
 float targetTemperature = 25.0; // Default target temperature
 float currentTemperature = 0.0;
