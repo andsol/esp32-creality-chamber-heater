@@ -20,7 +20,6 @@ SSD1306Wire display(I2C_ADDRESS, SDA, SCL);
 // PWM settings
 #define HEATER_PIN 16  // GPIO pin for heater control
 #define FAN_PIN 23    // GPIO pin for fan control
-#define TACH_PIN 18    // GPIO pin for tachometer input
 #define PWM_FREQ 25000 // 25 kHz frequency for Noctua fan
 #define PWM_RESOLUTION 8 // 8-bit resolution
 #define PWM_HEATER_LIMIT 200
@@ -86,9 +85,7 @@ void handleSetManualMode();
 void handleSetMoonrakerConfig();
 void handleSetTemperatureSource();
 void updatePWM();
-void updateTacho();
 void updateDisplay();
-void IRAM_ATTR handleTach();
 
 void onMessageCallback(websockets::WebsocketsMessage message);
 void onEventsCallback(websockets::WebsocketsEvent event, String data);
@@ -141,17 +138,9 @@ void setup() {
   ledcAttachPin(HEATER_PIN, 0);
   ledcSetup(1, PWM_FREQ, PWM_RESOLUTION); // 25 kHz PWM, 8-bit resolution
   ledcAttachPin(FAN_PIN, 1);
-  
-
-  // Initialize tachometer input
-  pinMode(TACH_PIN, INPUT_PULLUP);
-  digitalWrite(TACH_PIN, HIGH);
-  attachInterrupt(digitalPinToInterrupt(TACH_PIN), handleTach, FALLING);
 
   // Attempt initial connection to WebSocket
   attemptConnection();
-
-  // Update display and PWM initially
   updateDisplay();
   updatePWM();
 }
@@ -189,28 +178,8 @@ void loop() {
   // Update PWM values based on temperature
   updatePWM();
 
-  updateTacho();
-
   // Update the OLED display
   updateDisplay();
-}
-
-void updateTacho() {
-  // start of tacho measurement
-  if ((unsigned long)(millis() - lastTachTime) >= 1000)
-  { 
-    // detach interrupt while calculating rpm
-    detachInterrupt(digitalPinToInterrupt(TACH_PIN)); 
-    // calculate rpm
-    fanRPM = tachCount * ((float)60 / (float)2);
-    // Log.printf("fan rpm = %d\r\n", last_rpm);
-    tachCount = 0; 
-    // store milliseconds when tacho was measured the last time
-    lastTachTime = millis();
-
-    // attach interrupt again
-    attachInterrupt(digitalPinToInterrupt(TACH_PIN), handleTach, FALLING);
-  }
 }
 
 void handleRoot() {
@@ -379,22 +348,14 @@ void updateDisplay() {
   fanSpeedText += " %";
   display.drawString(20, 30, fanSpeedText);
 
-  String fanRpmText = "Fan RPM: ";
-  fanRpmText += fanRPM;
-  fanRpmText += " rpm";
-  display.drawString(20, 40, fanRpmText);
-
   String chambTempText = "Chamber Temp: ";
   chambTempText += chamberTemperature;
   chambTempText += " C";
-  display.drawString(20, 50, chambTempText);
+  display.drawString(20, 40, chambTempText);
 
   display.display();
 }
 
-void IRAM_ATTR handleTach() {
-  tachCount++;
-}
 
 void onMessageCallback(websockets::WebsocketsMessage message) {
   Serial.printf("Received: %s\n", message.data());
