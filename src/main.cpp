@@ -86,6 +86,7 @@ void handleSetManualMode();
 void handleSetMoonrakerConfig();
 void handleSetTemperatureSource();
 void updatePWM();
+void updateTacho();
 void updateDisplay();
 void IRAM_ATTR handleTach();
 
@@ -144,6 +145,7 @@ void setup() {
 
   // Initialize tachometer input
   pinMode(TACH_PIN, INPUT_PULLUP);
+  digitalWrite(TACH_PIN, HIGH);
   attachInterrupt(digitalPinToInterrupt(TACH_PIN), handleTach, FALLING);
 
   // Attempt initial connection to WebSocket
@@ -187,18 +189,28 @@ void loop() {
   // Update PWM values based on temperature
   updatePWM();
 
-  // Calculate fan RPM
-  if (currentTime - lastTachTime >= 1000) {
-    fanRPM = (tachCount * 60) / 2; // Tachometer gives 2 pulses per revolution
-    tachCount = 0;
-    lastTachTime = currentTime;
-  }
+  updateTacho();
 
   // Update the OLED display
   updateDisplay();
+}
 
-  // Add a small delay to avoid reading too frequently
-  delay(2000);
+void updateTacho() {
+  // start of tacho measurement
+  if ((unsigned long)(millis() - lastTachTime) >= 1000)
+  { 
+    // detach interrupt while calculating rpm
+    detachInterrupt(digitalPinToInterrupt(TACH_PIN)); 
+    // calculate rpm
+    fanRPM = tachCount * ((float)60 / (float)2);
+    // Log.printf("fan rpm = %d\r\n", last_rpm);
+    tachCount = 0; 
+    // store milliseconds when tacho was measured the last time
+    lastTachTime = millis();
+
+    // attach interrupt again
+    attachInterrupt(digitalPinToInterrupt(TACH_PIN), handleTach, FALLING);
+  }
 }
 
 void handleRoot() {
@@ -290,6 +302,7 @@ void updatePWM() {
         // Temperature is much lower than target, full load
         ledcWrite(0, PWM_HEATER_LIMIT);
         ledcWrite(1, 255);
+        fanSpeed = 100;
         isFanRunning = true;
       } else {
         // Temperature is closer to target, reduce heater power
@@ -297,6 +310,7 @@ void updatePWM() {
         pwmValue = constrain((int)pwmValue, 0, PWM_HEATER_LIMIT);
         ledcWrite(0, pwmValue);
         ledcWrite(1, 255);
+        fanSpeed = 100;
         isFanRunning = true;
       }
     } else {
@@ -310,14 +324,18 @@ void updatePWM() {
         // Check if 30 seconds have passed
         if (millis() - fanStopTime >= 30000) {
           ledcWrite(1, 0);
+          fanSpeed = 0;
           isFanRunning = false;
         } else {
           // Half speed
+          fanSpeed = 50;
           ledcWrite(1, 128);
         }
       }
     }
   } else {
+    fanSpeed = 0;
+    isFanRunning = false;
     ledcWrite(0, 0);
     ledcWrite(1, 0);
   }
