@@ -90,10 +90,8 @@ void updateDisplay();
 void onMessageCallback(websockets::WebsocketsMessage message);
 void onEventsCallback(websockets::WebsocketsEvent event, String data);
 
-
-void subscribeMoonraker();
 void attemptConnection();
-void sendContinueCommand();
+void subscribeMoonraker();
 
 void setup() {
   // Initialize serial communication
@@ -111,12 +109,23 @@ void setup() {
   display.displayOn(); 
   display.resetDisplay();
 
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(20, 0, "Boot...");
+
   // Initialize WiFi using WiFiManager
   WiFiManager wifiManager;
-  if (!wifiManager.autoConnect("ESP32_AP")) {
+  if (!wifiManager.autoConnect("Chamber Heater AP")) {
     Serial.println("Failed to connect and hit timeout");
     ESP.restart();
   }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    display.drawString(20, 10, "IP Address: " + String(WiFi.localIP()));
+  } else {
+    display.drawString(20, 10, "Acces Point: " + String(WiFi.softAPIP()));
+  }
+  
+  display.display();
 
   // Initialize NVS
   preferences.begin("moonraker", false);
@@ -130,6 +139,7 @@ void setup() {
   server.on("/setTargetTemp", handleSetTargetTemp);
   server.on("/setMoonrakerConfig", handleSetMoonrakerConfig);
   server.on("/setTemperatureSource", handleSetTemperatureSource);
+  server.on("/setManualMode", handleSetManualMode);
   server.begin();
   Serial.println("HTTP server started");
 
@@ -167,12 +177,6 @@ void loop() {
     dht.read(); // Read values from DHT20
     currentTemperature = dht.getTemperature();
     currentHumidity = dht.getHumidity();
-  }
-
-  // Check if waiting for temperature to reach target
-  if (waitingForTemperature && currentTemperature >= targetTemperature) {
-    sendContinueCommand();
-    waitingForTemperature = false;
   }
 
   // Update PWM values based on temperature
@@ -361,39 +365,30 @@ void onMessageCallback(websockets::WebsocketsMessage message) {
   Serial.printf("Received: %s\n", message.data());
   JsonDocument doc;
   deserializeJson(doc, message.data());
-  if (doc.containsKey("event")) {
-    String event = doc["event"].as<String>();
-    if (event == "PrintStarted") {
+  // Status
+  if (doc.containsKey("result") && doc["params"].containsKey("status") && doc["result"]["status"].containsKey("print_stats")) {
+    String event = doc["result"]["status"]["print_stats"]["state"].as<String>();
+    if (event == "printing") {
       isPrinting = true;
-      // Get target temperature from Moonraker API when print starts
-      if (WiFi.status() == WL_CONNECTED && moonrakerIp != "") {
-        HTTPClient http;
-        String url = "http://" + moonrakerIp + "/printer/gcode/script?script=M191";
-        http.begin(url);
-        http.addHeader("Authorization", "Bearer " + moonrakerAuth);
-        int httpResponseCode = http.GET();
-
-        if (httpResponseCode == 200) {
-          String payload = http.getString();
-          JsonDocument doc;
-          deserializeJson(doc, payload);
-          targetTemperature = doc["result"]["target_temperature"].as<float>();
-          Serial.println("Target Temperature: " + String(targetTemperature));
-          waitingForTemperature = true;
-        } else {
-          Serial.println("Error on HTTP request: " + String(httpResponseCode));
-        }
-        http.end();
-      } else {
-        Serial.println("WiFi Disconnected or Moonraker IP not set");
-      }
-    } else if (event == "PrintDone" || event == "PrintFailed") {
+    } else {
       isPrinting = false;
     }
-  } else if (doc.containsKey("params") && doc["params"].containsKey("temperature")) {
-    chamberTemperature = doc["params"]["temperature"]["chamber"]["actual"].as<float>();
+  } else if (doc.containsKey("params") && doc["params"].containsKey("temperature_sensor chamber_temp")) {
+    chamberTemperature = doc["params"]["temperature_sensor chamber_temp"]["temperature"].as<float>();
     if (!useDHT20) {
       currentTemperature = chamberTemperature;
+    }
+  } else if (doc.containsKey("method") && doc.containsKey("params") && doc["method"].as<String>() == "notify_gcode_response") {
+    JsonArray params = doc["params"];
+    for (const char* param : params) {
+      Serial.println(param);
+      // Check if the string contains the desired substring
+      if (strstr(param, "// Set chamber heater to: ") != nullptr) {
+        // Extract the temperature value from the string
+        float temperature = 0;
+        sscanf(param, "// Set chamber heater to: %f", &temperature);
+        targetTemperature = temperature;
+      }
     }
   }
 }
@@ -414,10 +409,9 @@ void webSocketEvent(websockets::WebsocketsEvent event, String data) {
 
 void subscribeMoonraker() {
   if (WiFi.status() == WL_CONNECTED && moonrakerIp != "") {
-    String auth = "Bearer " + moonrakerAuth;
-    webSocket.addHeader("Authorization", auth.c_str());
-    webSocket.send("{\"jsonrpc\":\"2.0\",\"method\":\"printer.subscribe\",\"params\":{\"topics\":[\"event.state\",\"temperature\"]},\"id\":1}");
-    
+    webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"print_stats\": [\"state\"]}},\"id\": 1}");
+    webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"webhooks\": [\"gcode_response\"]}},\"id\": 2}");
+    webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"temperature_sensor chamber_temp\": [\"temperature\"]}},\"id\": 3}");
   } else {
     Serial.println("WiFi Disconnected or Moonraker IP not set");
   }
@@ -425,31 +419,17 @@ void subscribeMoonraker() {
 
 void attemptConnection() {
   if (WiFi.status() == WL_CONNECTED && moonrakerIp != "") {
-    webSocket.connect(moonrakerIp.c_str(), 80, "/websocket");
-    webSocket.onEvent(webSocketEvent);
-    webSocket.onMessage(onMessageCallback);
-    // Send a ping
-    webSocket.ping();
-    lastConnectionAttempt = millis();
-  } else {
-    Serial.println("WiFi Disconnected or Moonraker IP not set");
-  }
-}
-
-void sendContinueCommand() {
-  if (WiFi.status() == WL_CONNECTED && moonrakerIp != "") {
-    HTTPClient http;
-    String url = "http://" + moonrakerIp + "/printer/gcode/script?script=CONTINUE";
-    http.begin(url);
-    http.addHeader("Authorization", "Bearer " + moonrakerAuth);
-    int httpResponseCode = http.GET();
-
-    if (httpResponseCode == 200) {
-      Serial.println("Sent continue command to Moonraker");
-    } else {
-      Serial.println("Error on HTTP request: " + String(httpResponseCode));
+    if (moonrakerAuth != "") {
+      String auth = "Bearer " + moonrakerAuth;
+      webSocket.addHeader("Authorization", auth.c_str());
     }
-    http.end();
+    if(!webSocket.connect(moonrakerIp.c_str(), (uint16_t) 7125, "/websocket")) {
+      Serial.println("Could not connect to websocket: " + moonrakerIp);
+    } else {
+      webSocket.onEvent(webSocketEvent);
+      webSocket.onMessage(onMessageCallback);
+    }
+    lastConnectionAttempt = millis();
   } else {
     Serial.println("WiFi Disconnected or Moonraker IP not set");
   }
