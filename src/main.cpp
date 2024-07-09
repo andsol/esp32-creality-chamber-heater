@@ -10,6 +10,12 @@
 #include <ArduinoWebsockets.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Ticker.h>
+
+// Create a Ticker object
+Ticker pollTicker;
+Ticker displayTicker;
+Ticker temperatureTicker;
 
 I2CScanner scanner;
 
@@ -30,8 +36,6 @@ WebServer server(80);
 // NVS (Non-Volatile Storage)
 Preferences preferences;
 
-websockets::WebsocketsClient webSocket; // Use the ArduinoWebsockets client
-
 DHT20 dht(&Wire); // Initialize the DHT20 object
 
 float targetTemperature = 25.0; // Default target temperature
@@ -48,6 +52,7 @@ unsigned long fanStopTime = 0; // Time when the fan should stop
 
 String moonrakerIp = "";
 String moonrakerAuth = "";
+bool isConnected = false;
 bool isPrinting = false;
 
 unsigned long lastConnectionAttempt = 0;
@@ -85,13 +90,127 @@ void handleSetManualMode();
 void handleSetMoonrakerConfig();
 void handleSetTemperatureSource();
 void updatePWM();
-void updateDisplay();
-
-void onMessageCallback(websockets::WebsocketsMessage message);
-void onEventsCallback(websockets::WebsocketsEvent event, String data);
-
 void attemptConnection();
 void subscribeMoonraker();
+
+void updateDisplay() {
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+
+  // Draw WiFi icon if connected
+  if (WiFi.status() == WL_CONNECTED) {
+    display.drawXbm(0, 0, ICON_WIDTH, ICON_HEIGHT, wifi_icon);
+  }
+
+  // Draw 3D printer icon if connected to Moonraker
+  if (isConnected) {
+    display.drawXbm(0, 20, ICON_WIDTH, ICON_HEIGHT, printer_icon);
+  }
+
+  if (isPrinting) {
+    display.drawXbm(0, 40, ICON_WIDTH, ICON_HEIGHT, printing_icon);
+  }
+
+  String temp = "Current Temp: ";
+  temp += currentTemperature;
+  temp += " C";
+  display.drawString(20, 0, temp);
+
+  String targetTemp = "Target Temp: ";
+  targetTemp += targetTemperature;
+  targetTemp += " C";
+  display.drawString(20, 10, targetTemp);
+
+  String humidity = "Humidity: ";
+  humidity += currentHumidity;
+  humidity += " %";
+  display.drawString(20, 20, humidity);
+
+  String fanSpeedText = "Fan Speed: ";
+  fanSpeedText += fanSpeed;
+  fanSpeedText += " %";
+  display.drawString(20, 30, fanSpeedText);
+
+  String chambTempText = "Chamber Temp: ";
+  chambTempText += chamberTemperature;
+  chambTempText += " C";
+  display.drawString(20, 40, chambTempText);
+
+  display.display();
+}
+
+void onMessageCallback(websockets::WebsocketsMessage message) {
+  Serial.printf("Received: %s\n", message.data());
+  JsonDocument doc;
+  deserializeJson(doc, message.data());
+  // Status
+  if (doc.containsKey("result") && doc["params"].containsKey("status") && doc["result"]["status"].containsKey("print_stats")) {
+    String event = doc["result"]["status"]["print_stats"]["state"].as<String>();
+    if (event == "printing") {
+      isPrinting = true;
+    } else {
+      isPrinting = false;
+    }
+  } else if (doc.containsKey("params") && doc["params"].containsKey("temperature_sensor chamber_temp")) {
+    chamberTemperature = doc["params"]["temperature_sensor chamber_temp"]["temperature"].as<float>();
+  } else if (doc.containsKey("method") && doc.containsKey("params") && doc["method"].as<String>() == "notify_gcode_response") {
+    JsonArray params = doc["params"];
+    for (const char* param : params) {
+      Serial.println(param);
+      // Check if the string contains the desired substring
+      if (strstr(param, "// Set chamber heater to: ") != nullptr) {
+        // Extract the temperature value from the string
+        float temperature = 0;
+        sscanf(param, "// Set chamber heater to: %f", &temperature);
+        targetTemperature = temperature;
+      }
+    }
+  }
+}
+
+void onEventsCallback(websockets::WebsocketsEvent event, String data) {
+  switch (event) {
+    case websockets::WebsocketsEvent::ConnectionClosed:
+      isConnected = false;
+      server.begin();
+      Serial.println("Disconnected from Moonraker");
+      break;
+    case websockets::WebsocketsEvent::ConnectionOpened:
+      Serial.println("Connected to Moonraker");
+      isConnected = true;
+      server.stop();
+      subscribeMoonraker();
+      break;
+    case websockets::WebsocketsEvent::GotPing:
+      Serial.println("Got a Ping!");
+      isConnected = true;
+      break;
+    case websockets::WebsocketsEvent::GotPong:
+      Serial.println("Got a Pong!");
+      isConnected = true;
+      break;
+    default:
+      break;
+  }
+}
+
+void updateTempareture() {
+    dht.read(); // Read values from DHT20
+    currentTemperature = dht.getTemperature();
+    currentHumidity = dht.getHumidity();
+}
+
+websockets::WebsocketsClient webSocket; // Use the ArduinoWebsockets client
+
+// Function to be called every 500 milliseconds
+void pollWebSocket() {
+  // Handle WebSocket communication
+  if (isConnected) {
+    Serial.println("Poll");
+    webSocket.poll();
+  }
+}
+
 
 void setup() {
   // Initialize serial communication
@@ -150,20 +269,41 @@ void setup() {
   ledcAttachPin(FAN_PIN, 1);
 
   // Attempt initial connection to WebSocket
+  webSocket.onMessage(onMessageCallback);
+  webSocket.onEvent(onEventsCallback);
+  
   attemptConnection();
-  updateDisplay();
   updatePWM();
+
+  pollTicker.attach_ms(500, pollWebSocket);
+  displayTicker.attach(1, updateDisplay);
+  temperatureTicker.attach(1, updateTempareture);
+
+
+    // Create the wifiTask on core 0
+  xTaskCreatePinnedToCore(
+    wifiTask,    // Function to implement the task
+    "wifiTask",  // Name of the task
+    10000,       // Stack size in words
+    NULL,        // Task input parameter
+    1,           // Priority of the task
+    NULL,        // Task handle
+    0);          // Core where the task should run
+
+  // Create the i2cTask on core 1
+  xTaskCreatePinnedToCore(
+    i2cTask,    // Function to implement the task
+    "i2cTask",  // Name of the task
+    10000,      // Stack size in words
+    NULL,       // Task input parameter
+    1,          // Priority of the task
+    NULL,       // Task handle
+    1);         // Core where the task should run
 }
 
 void loop() {
   // Handle web server requests
   server.handleClient();
-
-  // Handle WebSocket communication
-  if (webSocket.available()) {
-    webSocket.poll();
-  }
-  
 
   // Attempt to connect to WebSocket if not connected
   unsigned long currentTime = millis();
@@ -172,18 +312,12 @@ void loop() {
     lastConnectionAttempt = currentTime;
   }
 
-  // Read current temperature and humidity from DHT20
   if (useDHT20) {
-    dht.read(); // Read values from DHT20
-    currentTemperature = dht.getTemperature();
-    currentHumidity = dht.getHumidity();
+      chamberTemperature = currentTemperature;
   }
 
   // Update PWM values based on temperature
   updatePWM();
-
-  // Update the OLED display
-  updateDisplay();
 }
 
 void handleRoot() {
@@ -269,9 +403,9 @@ void handleSetManualMode() {
 void updatePWM() {
   // Heating and fan control logic
   if (isPrinting || manualMode) {
-    if (currentTemperature < targetTemperature) {
+    if (chamberTemperature < targetTemperature) {
       fanStopTime = 0; // Reset fan stop time
-      if (currentTemperature < targetTemperature - fullLoadThreshold) {
+      if (chamberTemperature < targetTemperature - fullLoadThreshold) {
         // Temperature is much lower than target, full load
         ledcWrite(0, PWM_HEATER_LIMIT);
         ledcWrite(1, 255);
@@ -279,7 +413,7 @@ void updatePWM() {
         isFanRunning = true;
       } else {
         // Temperature is closer to target, reduce heater power
-        float pwmValue = 255 * (targetTemperature - currentTemperature) / fullLoadThreshold;
+        float pwmValue = 255 * (targetTemperature - chamberTemperature) / fullLoadThreshold;
         pwmValue = constrain((int)pwmValue, 0, PWM_HEATER_LIMIT);
         ledcWrite(0, pwmValue);
         ledcWrite(1, 255);
@@ -314,101 +448,9 @@ void updatePWM() {
   }
 }
 
-void updateDisplay() {
-  display.clear();
-  display.setFont(ArialMT_Plain_10);
-
-  // Draw WiFi icon if connected
-  if (WiFi.status() == WL_CONNECTED) {
-    display.drawXbm(0, 0, ICON_WIDTH, ICON_HEIGHT, wifi_icon);
-  }
-
-  // Draw 3D printer icon if connected to Moonraker
-  if (webSocket.available()) {
-    display.drawXbm(0, 20, ICON_WIDTH, ICON_HEIGHT, printer_icon);
-  }
-
-  if (isPrinting) {
-    display.drawXbm(0, 40, ICON_WIDTH, ICON_HEIGHT, printing_icon);
-  }
-
-  String temp = "Current Temp: ";
-  temp += currentTemperature;
-  temp += " C";
-  display.drawString(20, 0, temp);
-
-  String targetTemp = "Target Temp: ";
-  targetTemp += targetTemperature;
-  targetTemp += " C";
-  display.drawString(20, 10, targetTemp);
-
-  String humidity = "Humidity: ";
-  humidity += currentHumidity;
-  humidity += " %";
-  display.drawString(20, 20, humidity);
-
-  String fanSpeedText = "Fan Speed: ";
-  fanSpeedText += fanSpeed;
-  fanSpeedText += " %";
-  display.drawString(20, 30, fanSpeedText);
-
-  String chambTempText = "Chamber Temp: ";
-  chambTempText += chamberTemperature;
-  chambTempText += " C";
-  display.drawString(20, 40, chambTempText);
-
-  display.display();
-}
-
-
-void onMessageCallback(websockets::WebsocketsMessage message) {
-  Serial.printf("Received: %s\n", message.data());
-  JsonDocument doc;
-  deserializeJson(doc, message.data());
-  // Status
-  if (doc.containsKey("result") && doc["params"].containsKey("status") && doc["result"]["status"].containsKey("print_stats")) {
-    String event = doc["result"]["status"]["print_stats"]["state"].as<String>();
-    if (event == "printing") {
-      isPrinting = true;
-    } else {
-      isPrinting = false;
-    }
-  } else if (doc.containsKey("params") && doc["params"].containsKey("temperature_sensor chamber_temp")) {
-    chamberTemperature = doc["params"]["temperature_sensor chamber_temp"]["temperature"].as<float>();
-    if (!useDHT20) {
-      currentTemperature = chamberTemperature;
-    }
-  } else if (doc.containsKey("method") && doc.containsKey("params") && doc["method"].as<String>() == "notify_gcode_response") {
-    JsonArray params = doc["params"];
-    for (const char* param : params) {
-      Serial.println(param);
-      // Check if the string contains the desired substring
-      if (strstr(param, "// Set chamber heater to: ") != nullptr) {
-        // Extract the temperature value from the string
-        float temperature = 0;
-        sscanf(param, "// Set chamber heater to: %f", &temperature);
-        targetTemperature = temperature;
-      }
-    }
-  }
-}
-
-void webSocketEvent(websockets::WebsocketsEvent event, String data) {
-  switch (event) {
-    case websockets::WebsocketsEvent::ConnectionClosed:
-      Serial.println("Disconnected from Moonraker");
-      break;
-    case websockets::WebsocketsEvent::ConnectionOpened:
-      Serial.println("Connected to Moonraker");
-      subscribeMoonraker();
-      break;
-    default:
-      break;
-  }
-}
-
 void subscribeMoonraker() {
-  if (WiFi.status() == WL_CONNECTED && moonrakerIp != "") {
+  if (isConnected) {
+    Serial.println("Subscribing");
     webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"print_stats\": [\"state\"]}},\"id\": 1}");
     webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"webhooks\": [\"gcode_response\"]}},\"id\": 2}");
     webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"temperature_sensor chamber_temp\": [\"temperature\"]}},\"id\": 3}");
@@ -426,8 +468,8 @@ void attemptConnection() {
     if(!webSocket.connect(moonrakerIp.c_str(), (uint16_t) 7125, "/websocket")) {
       Serial.println("Could not connect to websocket: " + moonrakerIp);
     } else {
-      webSocket.onEvent(webSocketEvent);
-      webSocket.onMessage(onMessageCallback);
+      // Send a ping
+      webSocket.ping();
     }
     lastConnectionAttempt = millis();
   } else {
