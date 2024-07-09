@@ -278,27 +278,6 @@ void setup() {
   pollTicker.attach_ms(500, pollWebSocket);
   displayTicker.attach(1, updateDisplay);
   temperatureTicker.attach(1, updateTempareture);
-
-
-    // Create the wifiTask on core 0
-  xTaskCreatePinnedToCore(
-    wifiTask,    // Function to implement the task
-    "wifiTask",  // Name of the task
-    10000,       // Stack size in words
-    NULL,        // Task input parameter
-    1,           // Priority of the task
-    NULL,        // Task handle
-    0);          // Core where the task should run
-
-  // Create the i2cTask on core 1
-  xTaskCreatePinnedToCore(
-    i2cTask,    // Function to implement the task
-    "i2cTask",  // Name of the task
-    10000,      // Stack size in words
-    NULL,       // Task input parameter
-    1,          // Priority of the task
-    NULL,       // Task handle
-    1);         // Core where the task should run
 }
 
 void loop() {
