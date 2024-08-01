@@ -5,18 +5,32 @@
 #include <DHT20.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
-#include <ArduinoWebsockets.h>
+#include <WebSocketsClient.h>
+#include <WebSocketsServer.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <PID_v1.h>
 #include <Ticker.h>
 
-websockets::WebsocketsClient webSocket; // Use the ArduinoWebsockets client
 WiFiManager wifiManager;
 WebServer server(80);
+WebSocketsClient webSocket;
+WebSocketsServer webSocketServer = WebSocketsServer(81);
 
 // Create a Ticker object
 Ticker displayTicker;
 Ticker temperatureTicker;
+Ticker metricsTicker;
+
+// PID parameters for heater
+double topSetpoint, topInput, heaterOutput;
+double Kp = 1, Ki = 0, Kd = 0; // Initial PID values for heater
+PID heaterPID(&topInput, &heaterOutput, &topSetpoint, Kp, Ki, Kd, DIRECT);
+
+// PID parameters for fan
+double fanSetpoint, fanInput, fanOutput;
+double fanKp = 1, fanKi = 0, fanKd = 0; // Initial PID values for fan
+PID fanPID(&fanInput, &fanOutput, &fanSetpoint, fanKp, fanKi, fanKd, DIRECT);
 
 I2CScanner scanner;
 
@@ -25,30 +39,39 @@ I2CScanner scanner;
 SSD1306Wire display(I2C_ADDRESS, SDA, SCL);
 
 // PWM settings
-#define HEATER_PIN 16  // GPIO pin for heater control
+#define FAN_TACH_PIN 4
+#define FAN_POWER_PIN 13
 #define FAN_PIN 23    // GPIO pin for fan control
+#define HEATER_PIN 16  // GPIO pin for heater control
 #define PWM_FREQ 25000 // 25 kHz frequency for Noctua fan
 #define PWM_RESOLUTION 8 // 8-bit resolution
-#define PWM_HEATER_LIMIT 200
+#define PWM_HEATER_LIMIT 220
 
 // NVS (Non-Volatile Storage)
 Preferences preferences;
 
 DHT20 dht(&Wire); // Initialize the DHT20 object
 
-float targetTemperature = 25.0; // Default target temperature
-const float fullLoadThreshold = 5.0; // Temperature threshold for full load
+float targetTemperature = 22.0; // Default target temperature
+float maxTemperature = 70.0; // Default target temperature
+const float fullLoadThreshold = 40.0; // Default target temperature
+const float halfLoadThreshold = 5.0; // Temperature threshold for full load
+
 float dhtTemperature = 0.0;
 float dhtHumidity = 0.0;
+
 float chamberTemperature = 0.0;
 float currentTemperature = 0.0;
 
+int maxFanSpeed = 100;
 int fanSpeed = 0;
-volatile unsigned long tachCount = 0;
-unsigned long lastTachTime = 0;
-int fanRPM = 0;
+int heaterDuty = 0;
+volatile unsigned long tachCounter;
+volatile unsigned long lastTachTime= 0;
 bool isFanRunning = false; // Fan state
 unsigned long fanStopTime = 0; // Time when the fan should stop
+volatile unsigned long pulseInterval = 0;
+int fanRPM = 0; // the average
 
 String moonrakerIp = "";
 String moonrakerAuth = "";
@@ -83,15 +106,150 @@ static const unsigned char PROGMEM printing_icon[] = {
 0x00,0x00
 };
 
+// socket page content
+const char* htmlMetrics = R"rawliteral(
+  <div id="metrics">
+    <div class="metric">Top Temperature: <span id="chamberTemperature">--</span> &deg;C</div>
+    <div class="metric">Bottom Temperature: <span id="dhtTemperature">--</span> &deg;C</div>
+    <div class="metric">Bottom Humidity: <span id="dhtHumiduty">--</span> %</div>
+    <div class="metric">Heater Duty: <span id="heaterDuty">--</span> %</div>
+    <div class="metric">Fan Duty: <span id="fanDuty">--</span> %</div>
+  </div>
+  <div id="chart-container" style="height:250px">
+    <canvas id="temperatureChart"></canvas>
+  </div>
+  <script>
+    const socket = new WebSocket('ws://' + window.location.hostname + ':81');
+
+    const ctx = document.getElementById('temperatureChart').getContext('2d');
+    const temperatureChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [], // Time labels
+        datasets: [
+          {
+            label: 'Top Temperature (C)',
+            borderColor: '#ff6384',
+            data: [],
+            fill: false,
+          },
+          {
+            label: 'Bottom Temperature (C)',
+            borderColor: '#ff9f40',
+            data: [],
+            fill: false,
+          },
+          {
+            label: 'Humidity (%)',
+            borderColor: '#36a2eb',
+            data: [],
+            fill: false,
+          },
+          {
+            label: 'Heater duty (%)',
+            borderColor: '#4bc0c0',
+            data: [],
+            fill: false,
+          },
+          {
+            label: 'Fan Duty (%)',
+            borderColor: '#9966ff',
+            data: [],
+            fill: false,
+          },
+          {
+            label: 'Target Temperature (C)',
+            borderColor: '#cc65fe',
+            data: [],
+            fill: false,
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            type: 'realtime',
+            realtime: {
+              duration: 20000,
+              refresh: 1000,
+              delay: 1000
+            }
+          },
+          y: {
+            beginAtZero: false
+          }
+        },
+        plugins: {
+          // Change options for ALL axes of THIS CHART
+          streaming: {
+            duration: 20000
+          }
+        }
+      }
+    });
+
+    socket.onopen = function() {
+      console.log('WebSocket connection established');
+    };
+
+    socket.onmessage = function(event) {
+      const metrics = JSON.parse(event.data);
+      document.getElementById('chamberTemperature').innerText = metrics.chamberTemperature;
+      document.getElementById('dhtTemperature').innerText = metrics.dhtTemperature;
+      document.getElementById('dhtHumiduty').innerText = metrics.dhtHumiduty;
+      document.getElementById('heaterDuty').innerText = metrics.heaterDuty;
+      document.getElementById('fanDuty').innerText = metrics.fanDuty;
+
+      // Add data to chart
+      temperatureChart.data.datasets[0].data.push({x: Date.now(), y: metrics.chamberTemperature});
+      temperatureChart.data.datasets[1].data.push({x: Date.now(), y: metrics.dhtTemperature});
+      temperatureChart.data.datasets[2].data.push({x: Date.now(), y: metrics.dhtHumiduty});
+      temperatureChart.data.datasets[3].data.push({x: Date.now(), y: metrics.heaterDuty});
+      temperatureChart.data.datasets[4].data.push({x: Date.now(), y: metrics.fanDuty});
+      temperatureChart.data.datasets[5].data.push({x: Date.now(), y: metrics.targetTemperature});
+      temperatureChart.update('quiet');
+    };
+
+    socket.onclose = function() {
+      console.log('WebSocket connection closed');
+    };
+
+    socket.onerror = function(error) {
+      console.error('WebSocket error:', error);
+    };
+  </script>
+)rawliteral";
+
 // Function declarations
 void handleRoot();
 void handleSetTargetTemp();
+void handleSetMaxFanSpeed();
 void handleSetManualMode();
 void handleSetMoonrakerConfig();
 void handleSetTemperatureSource();
 void updatePWM();
 void attemptConnection();
 void subscribeMoonraker();
+
+void IRAM_ATTR tachISR() {
+  tachCounter++;
+}
+
+void updateMetrics() {
+  // Prepare metrics JSON
+  String metrics = "{";
+  metrics += "\"chamberTemperature\": " + String(chamberTemperature, 2) + ",";
+  metrics += "\"dhtTemperature\": " + String(dhtTemperature, 2) + ",";
+  metrics += "\"dhtHumiduty\": " + String(dhtHumidity, 2) + ",";
+  metrics += "\"heaterDuty\": " + String(heaterDuty, 2) + ",";
+  metrics += "\"fanDuty\": " + String(fanSpeed, 2) + ",";
+  metrics += "\"targetTemperature\": " + String(targetTemperature, 2);
+  metrics += "}";
+
+  webSocketServer.broadcastTXT(metrics);
+}
 
 void updateDisplay() {
   display.clear();
@@ -136,74 +294,98 @@ void updateDisplay() {
   fanSpeedText += " %";
   display.drawString(20, 40, fanSpeedText);
 
-  String surrentSensor = "Sensor: ";
-  surrentSensor += useDHT20? "Heater" : "Chamber";
-  display.drawString(20, 50, surrentSensor);
+  // String surrentSensor = "Sensor: ";
+  // surrentSensor += useDHT20? "Heater" : "Chamber";
+  // display.drawString(20, 50, surrentSensor);
+
+  String currentFanRpm = "Fan RPM: ";
+  currentFanRpm += fanRPM;
+  display.drawString(20, 50, currentFanRpm);
 
   display.display();
 }
 
-void onMessageCallback(websockets::WebsocketsMessage message) {
-  // Serial.print("Received message: ");
-  // Serial.println(message.data());
-  JsonDocument doc;
-  deserializeJson(doc, message.data());
-  // Status
-  if (doc.containsKey("result") && doc["params"].containsKey("status") && doc["result"]["status"].containsKey("print_stats")) {
-    String event = doc["result"]["status"]["print_stats"]["state"].as<String>();
-    if (event == "printing") {
-      isPrinting = true;
-    } else {
-      isPrinting = false;
-    }
-  } else if (doc.containsKey("params") && doc.containsKey("method") && doc["method"] == "notify_status_update"
-    && doc["params"].is<JsonArray>() && doc["params"].size() > 0) {
-    // Iterate through the "params" array
-    for (JsonVariant value : doc["params"].as<JsonArray>()) {
-      // Check if the current element contains the key
-      if (value.is<JsonObject>() && value.containsKey("temperature_sensor chamber_temp")) {
-        // Extract the temperature value
-        chamberTemperature = (float) value["temperature_sensor chamber_temp"]["temperature"];
-        break;
-      }
-    }
-  } else if (doc.containsKey("method") && doc.containsKey("params") && doc["method"] == "notify_gcode_response"
-      && doc["params"].is<JsonArray>() && doc["params"].size() > 0) {
-    Serial.println("Found gCode history");
-    JsonArray params = doc["params"];
-    for (const char* param : params) {
-      Serial.println(param);
-      // Check if the string contains the desired substring
-      if (strstr(param, "// Set chamber heater to: ") != nullptr) {
-        // Extract the temperature value from the string
-        float temperature = 0;
-        sscanf(param, "// Set chamber heater to: %f", &temperature);
-        targetTemperature = temperature;
-      }
-    }
-  }
-}
-
-void onEventsCallback(websockets::WebsocketsEvent event, String data) {
-  switch (event) {
-    case websockets::WebsocketsEvent::ConnectionClosed:
+void onEventsCallback(WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
       isConnected = false;
       Serial.println("Disconnected from Moonraker");
       break;
-    case websockets::WebsocketsEvent::ConnectionOpened:
+    case WStype_CONNECTED:
       Serial.println("Connected to Moonraker");
       isConnected = true;
       subscribeMoonraker();
       break;
-    case websockets::WebsocketsEvent::GotPing:
-      isConnected = true;
+    case WStype_TEXT:
+      // Serial.print("Received message: ");
+      // Serial.println(message.data());
+      JsonDocument doc;
+      deserializeJson(doc, payload);
+      // Status
+      if (doc.containsKey("result") && doc["params"].containsKey("status") && doc["result"]["status"].containsKey("print_stats")) {
+        String event = doc["result"]["status"]["print_stats"]["state"].as<String>();
+        if (event == "printing") {
+          isPrinting = true;
+        } else {
+          isPrinting = false;
+        }
+      } else if (doc.containsKey("params") && doc.containsKey("method") && doc["method"] == "notify_status_update"
+        && doc["params"].is<JsonArray>() && doc["params"].size() > 0) {
+        // Iterate through the "params" array
+        for (JsonVariant value : doc["params"].as<JsonArray>()) {
+          // Check if the current element contains the key
+          if (value.is<JsonObject>() && value.containsKey("temperature_sensor chamber_temp")) {
+            // Extract the temperature value
+            chamberTemperature = (float) value["temperature_sensor chamber_temp"]["temperature"];
+            continue;
+          }
+        }
+      } else if (doc.containsKey("method") && doc.containsKey("params") && doc["method"] == "notify_gcode_response"
+          && doc["params"].is<JsonArray>() && doc["params"].size() > 0) {
+        Serial.println("Found gCode history");
+        JsonArray params = doc["params"];
+        for (const char* param : params) {
+          Serial.println(param);
+          // Check if the string contains the desired substring
+          if (strstr(param, "// Set chamber heater to: ") != nullptr) {
+            // Extract the temperature value from the string
+            float temperature = 0;
+            sscanf(param, "// Set chamber heater to: %f", &temperature);
+            targetTemperature = temperature;
+          }
+        }
+      }
       break;
-    case websockets::WebsocketsEvent::GotPong:
-      isConnected = true;
-      break;
-    default:
-      break;
+
   }
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+
+    switch(type) {
+        case WStype_DISCONNECTED:
+            Serial.println("Disconnected from webpage");
+            break;
+        case WStype_CONNECTED:
+            Serial.println("Connected to webpage");
+            break;
+        case WStype_TEXT:
+            //Serial.println("[%u] get Text: %s\n", num, payload);
+            // send message to client
+            // webSocket.sendTXT(num, "message here");
+
+            // send data to all connected clients
+            // webSocket.broadcastTXT("message here");
+            break;
+        case WStype_BIN:
+        case WStype_ERROR:			
+        case WStype_FRAGMENT_TEXT_START:
+        case WStype_FRAGMENT_BIN_START:
+        case WStype_FRAGMENT:
+        case WStype_FRAGMENT_FIN:
+			      break;
+    }
+
 }
 
 void updateTempareture() {
@@ -216,6 +398,13 @@ void updateTempareture() {
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
+
+  pinMode(FAN_POWER_PIN, OUTPUT);
+  // Initially turn off the LM2596 module
+  digitalWrite(FAN_POWER_PIN, HIGH);
+  pinMode(FAN_TACH_PIN, INPUT_PULLUP);  // Enable internal pull-up resistor
+  
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), tachISR, FALLING);
   
   ledcWrite(0, 0);
   ledcWrite(1, 0);
@@ -258,12 +447,14 @@ void setup() {
   moonrakerAuth = preferences.getString("auth", "");
   useDHT20 = preferences.getBool("useDHT20", true);
   manualMode = preferences.getBool("manualMode", false);
+  maxFanSpeed = preferences.getInt("maxFanSpeed", 100);
 
   delay(5000);
 
   // Initialize the web server
   server.on("/", handleRoot);
   server.on("/setTargetTemp", handleSetTargetTemp);
+  server.on("/setMaxFanSpeed", handleSetMaxFanSpeed);
   server.on("/setMoonrakerConfig", handleSetMoonrakerConfig);
   server.on("/setTemperatureSource", handleSetTemperatureSource);
   server.on("/setManualMode", handleSetManualMode);
@@ -277,31 +468,54 @@ void setup() {
   ledcAttachPin(FAN_PIN, 1);
 
   // Attempt initial connection to WebSocket
-  webSocket.onMessage(onMessageCallback);
   webSocket.onEvent(onEventsCallback);
-  
+
+  // Start WebSocket server
+  webSocketServer.begin();
+  webSocketServer.onEvent(webSocketEvent);
+
+  // display.drawString(0, 20, "Socket server: " + webSocketServer.clientIsConnected()? "Yes" : "No");
+  // display.display();
+
   //attemptConnection();
   updatePWM();
 
   displayTicker.attach(1, updateDisplay);
+  metricsTicker.attach(1, updateMetrics);
   temperatureTicker.attach(1, updateTempareture);
 
-  display.drawString(0, 20, "Boot complete");
+  display.drawString(0, 30, "Boot complete");
   display.display();
 }
 
 void loop() {
+  webSocketServer.loop();
+
   // Handle web server requests
   server.handleClient();
+
   if (isConnected) {
-    webSocket.poll();
+    webSocket.loop();
   }
 
   // Attempt to connect to WebSocket if not connected
   unsigned long currentTime = millis();
-  if (!webSocket.available() && currentTime - lastConnectionAttempt >= connectionInterval) {
+  if (!webSocket.isConnected() && currentTime - lastConnectionAttempt >= connectionInterval) {
     attemptConnection();
     lastConnectionAttempt = currentTime;
+  }
+
+  // Update every second
+  unsigned long currentTimeMicros = micros();
+  unsigned long timeDiff = currentTimeMicros - lastTachTime;
+  if (timeDiff > 1000000) {
+    noInterrupts();
+    unsigned long pulses = tachCounter;
+    tachCounter = 0;
+    interrupts();
+    fanRPM = (pulses * 60.0) / 2.0;
+    lastTachTime = currentTimeMicros;
+    Serial.println("RPM pulses: " + String(pulses) + " Seconds passed:" + String(timeDiff/1000000));
   }
 
   // Update PWM values based on temperature
@@ -309,13 +523,16 @@ void loop() {
 }
 
 void handleRoot() {
-  String html = "<html><head><link rel=\"stylesheet\" href=\"https://cdn.simplecss.org/simple.min.css\"></head><body>";
+  String html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><link rel=\"stylesheet\" href=\"https://cdn.simplecss.org/simple.min.css\">";
+  html += "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script><script src=\"https://cdn.jsdelivr.net/npm/luxon\"></script><script src=\"https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon\"></script><script src=\"https://cdn.jsdelivr.net/npm/chartjs-plugin-streaming\"></script></head><body>";
   html += "<header><h1>Moonraker chamber Heater Control</h1>";
-  html += "<p>Heater Temperature: " + String(dhtTemperature) + " &deg;C</p>";
-  html += "<p>Heater Humidity: " + String(dhtHumidity) + " %</p>";
   html += "<p>Target Temperature: " + String(targetTemperature) + " &deg;C</p>";
-  html += "<p>Chamber Temperature: " + String(chamberTemperature) + " &deg;C</p>";
+  html += htmlMetrics;
   html += "</header>";
+  html += "<form action=\"/setMaxFanSpeed\" method=\"POST\">";
+  html += "Set Max Fan Speed %: <input type=\"text\" name=\"maxFanSpeed\" value=\"" + String(maxFanSpeed) + "\"><br>";
+  html += "<input type=\"submit\" value=\"Set\">";
+  html += "</form>";
   html += "<main><form action=\"/setTargetTemp\" method=\"POST\">";
   html += "Set Target Temperature: <input type=\"text\" name=\"targetTemp\"><br>";
   html += "<input type=\"submit\" value=\"Set\">";
@@ -328,14 +545,14 @@ void handleRoot() {
   html += "</form>";
   html += "<h2>Temperature Source</h2>";
   html += "<form action=\"/setTemperatureSource\" method=\"POST\">";
-  html += "Use DHT20 Sensor: <input type=\"radio\" name=\"source\" value=\"DHT20\" " + String(useDHT20 ? "checked" : "") + "><br>";
-  html += "Use Moonraker API: <input type=\"radio\" name=\"source\" value=\"Moonraker\" " + String(!useDHT20 ? "checked" : "") + "><br>";
+  html += "Heater sensor: <input type=\"radio\" name=\"source\" value=\"DHT20\" " + String(useDHT20 ? "checked" : "") + "><br>";
+  html += "Moonraker: <input type=\"radio\" name=\"source\" value=\"Moonraker\" " + String(!useDHT20 ? "checked" : "") + "><br>";
   html += "<input type=\"submit\" value=\"Set\">";
   html += "</form>";
-  html += "<h2>Manual mode</h2>";
+  html += "<h2>Mode</h2>";
   html += "<form action=\"/setManualMode\" method=\"POST\">";
   html += "Manual: <input type=\"radio\" name=\"mode\" value=\"Yes\" " + String(manualMode ? "checked" : "") + "><br>";
-  html += "Use Moonraker API: <input type=\"radio\" name=\"mode\" value=\"No\" " + String(!manualMode ? "checked" : "") + "><br>";
+  html += "Moonraker: <input type=\"radio\" name=\"mode\" value=\"No\" " + String(!manualMode ? "checked" : "") + "><br>";
   html += "<input type=\"submit\" value=\"Set\">";
   html += "</form></main>";
   html += "</body></html>";
@@ -347,6 +564,16 @@ void handleSetTargetTemp() {
   if (server.hasArg("targetTemp")) {
     targetTemperature = server.arg("targetTemp").toFloat();
     Serial.println("New target temperature set to: " + String(targetTemperature));
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSetMaxFanSpeed() {
+  if (server.hasArg("maxFanSpeed")) {
+    maxFanSpeed = server.arg("maxFanSpeed").toInt();
+    Serial.println("New max fan speed set to: " + String(maxFanSpeed));
+    preferences.putInt("maxFanSpeed", maxFanSpeed);
   }
   server.sendHeader("Location", "/");
   server.send(303);
@@ -396,21 +623,44 @@ void updatePWM() {
     currentTemperature = chamberTemperature;
   }
 
+  // Temperature protection
+  if (maxTemperature < chamberTemperature || maxTemperature < dhtTemperature) {
+    ledcWrite(0, 0);
+    ledcWrite(1, 0);
+    digitalWrite(FAN_POWER_PIN, HIGH);
+    return;
+  }
+
   if (currentTemperature != 0.0 && currentTemperature < targetTemperature) {
     fanStopTime = 0; // Reset fan stop time
     if (currentTemperature < targetTemperature - fullLoadThreshold) {
       // Temperature is much lower than target, full load
       ledcWrite(0, PWM_HEATER_LIMIT);
-      ledcWrite(1, 255);
-      fanSpeed = 100;
+      digitalWrite(FAN_POWER_PIN, LOW);
+      // Fan speed
+      int currentFanSpeed = map(maxFanSpeed, 0, 100, 0, 255);
+      ledcWrite(1, currentFanSpeed);
+      fanSpeed = maxFanSpeed;
+      isFanRunning = true;
+    } else if (currentTemperature < targetTemperature - halfLoadThreshold) {
+      // Temperature is much lower than target, full load
+      ledcWrite(0, PWM_HEATER_LIMIT);
+      digitalWrite(FAN_POWER_PIN, LOW);
+      // Fan speed
+      int currentFanSpeed = map(maxFanSpeed, 0, 100, 0, 255);
+      ledcWrite(1, currentFanSpeed);
+      fanSpeed = maxFanSpeed;
       isFanRunning = true;
     } else {
       // Temperature is closer to target, reduce heater power
-      float pwmValue = 255 * (targetTemperature - currentTemperature) / fullLoadThreshold;
+      float pwmValue = 255 * (targetTemperature - currentTemperature) / halfLoadThreshold;
       pwmValue = constrain((int)pwmValue, 0, PWM_HEATER_LIMIT);
       ledcWrite(0, pwmValue);
-      ledcWrite(1, 255);
-      fanSpeed = 100;
+      digitalWrite(FAN_POWER_PIN, LOW);
+      // Fan speed
+      int currentFanSpeed = map(maxFanSpeed, 0, 100, 0, 255);
+      ledcWrite(1, currentFanSpeed);
+      fanSpeed = maxFanSpeed;
       isFanRunning = true;
     }
   } else {
@@ -424,12 +674,16 @@ void updatePWM() {
       // Check if 30 seconds have passed
       if (millis() - fanStopTime >= 30000) {
         ledcWrite(1, 0);
+        digitalWrite(FAN_POWER_PIN, HIGH);
         fanSpeed = 0;
         isFanRunning = false;
       } else {
         // Half speed
-        fanSpeed = 50;
-        ledcWrite(1, 128);
+        digitalWrite(FAN_POWER_PIN, LOW);
+        fanSpeed = 30;
+        int currentFanSpeed = map(fanSpeed, 0, 100, 0, 255);
+        ledcWrite(1, currentFanSpeed);
+        ledcWrite(1, 80);
       }
     }
   }
@@ -438,9 +692,9 @@ void updatePWM() {
 void subscribeMoonraker() {
   if (isConnected) {
     Serial.println("Subscribing");
-    webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"print_stats\": [\"state\"]}},\"id\": 1}");
-    webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"webhooks\": [\"gcode_response\"]}},\"id\": 2}");
-    webSocket.send("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"temperature_sensor chamber_temp\": [\"temperature\"]}},\"id\": 3}");
+    webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"print_stats\": [\"state\"]}},\"id\": 1}");
+    webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"webhooks\": [\"gcode_response\"]}},\"id\": 2}");
+    webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"temperature_sensor chamber_temp\": [\"temperature\"]}},\"id\": 3}");
   } else {
     Serial.println("WiFi Disconnected or Moonraker IP not set");
   }
@@ -449,15 +703,10 @@ void subscribeMoonraker() {
 void attemptConnection() {
   if (WiFi.status() == WL_CONNECTED && moonrakerIp != "") {
     if (moonrakerAuth != "") {
-      String auth = "Bearer " + moonrakerAuth;
-      webSocket.addHeader("Authorization", auth.c_str());
+      String auth = "Authorization: Bearer " + moonrakerAuth;
+      webSocket.setExtraHeaders(auth.c_str());
     }
-    if(!webSocket.connect(moonrakerIp.c_str(), (uint16_t) 7125, "/websocket")) {
-      Serial.println("Could not connect to websocket: " + moonrakerIp);
-    } else {
-      // Send a ping
-      webSocket.ping();
-    }
+    webSocket.begin(moonrakerIp.c_str(), (uint16_t) 7125, "/websocket");
     lastConnectionAttempt = millis();
   } else {
     Serial.println("WiFi Disconnected or Moonraker IP not set");
