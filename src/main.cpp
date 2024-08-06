@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <Wire.h>
 #include "I2CScanner.h"
@@ -5,12 +6,16 @@
 #include <DHT20.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
+
+
+
 #include <WebSocketsClient.h>
 #include <WebSocketsServer.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include <PID_v1.h>
 #include <Ticker.h>
+
 
 WiFiManager wifiManager;
 WebServer server(80);
@@ -21,16 +26,30 @@ WebSocketsServer webSocketServer = WebSocketsServer(81);
 Ticker displayTicker;
 Ticker temperatureTicker;
 Ticker metricsTicker;
+Ticker pwmTicker;
+
+double targetTemperature = 22.0; // Default target temperature
+float maxTemperature = 70.0; // Default target temperature
+const float fullLoadThreshold = 40.0; // Default target temperature
+const float halfLoadThreshold = 5.0; // Temperature threshold for full load
+
+float dhtTemperature = 0.0;
+float dhtHumidity = 0.0;
+
+float chamberTemperature = 0.0;
+double currentTemperature = 0.0;
 
 // PID parameters for heater
-double topSetpoint, topInput, heaterOutput;
+double heaterOutput;
+String heaterPIDStr = "1,0,0";
 double Kp = 1, Ki = 0, Kd = 0; // Initial PID values for heater
-PID heaterPID(&topInput, &heaterOutput, &topSetpoint, Kp, Ki, Kd, DIRECT);
+PID heaterPID(&currentTemperature, &heaterOutput, &targetTemperature, Kp, Ki, Kd, DIRECT);
 
 // PID parameters for fan
-double fanSetpoint, fanInput, fanOutput;
+double fanOutput;
+String fanPIDStr = "1,0,0";
 double fanKp = 1, fanKi = 0, fanKd = 0; // Initial PID values for fan
-PID fanPID(&fanInput, &fanOutput, &fanSetpoint, fanKp, fanKi, fanKd, DIRECT);
+PID fanPID(&currentTemperature, &fanOutput, &targetTemperature, fanKp, fanKi, fanKd, DIRECT);
 
 I2CScanner scanner;
 
@@ -52,20 +71,7 @@ Preferences preferences;
 
 DHT20 dht(&Wire); // Initialize the DHT20 object
 
-float targetTemperature = 22.0; // Default target temperature
-float maxTemperature = 70.0; // Default target temperature
-const float fullLoadThreshold = 40.0; // Default target temperature
-const float halfLoadThreshold = 5.0; // Temperature threshold for full load
-
-float dhtTemperature = 0.0;
-float dhtHumidity = 0.0;
-
-float chamberTemperature = 0.0;
-float currentTemperature = 0.0;
-
 int maxFanSpeed = 100;
-int fanSpeed = 0;
-int heaterDuty = 0;
 volatile unsigned long tachCounter;
 volatile unsigned long lastTachTime= 0;
 bool isFanRunning = false; // Fan state
@@ -168,11 +174,12 @@ const char* htmlMetrics = R"rawliteral(
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        pointStyle: false,
         scales: {
           x: {
             type: 'realtime',
             realtime: {
-              duration: 20000,
+              duration: 200000,
               refresh: 1000,
               delay: 1000
             }
@@ -184,7 +191,6 @@ const char* htmlMetrics = R"rawliteral(
         plugins: {
           // Change options for ALL axes of THIS CHART
           streaming: {
-            duration: 20000
           }
         }
       }
@@ -229,6 +235,7 @@ void handleSetMaxFanSpeed();
 void handleSetManualMode();
 void handleSetMoonrakerConfig();
 void handleSetTemperatureSource();
+void handleSetPID();
 void updatePWM();
 void attemptConnection();
 void subscribeMoonraker();
@@ -243,8 +250,8 @@ void updateMetrics() {
   metrics += "\"chamberTemperature\": " + String(chamberTemperature, 2) + ",";
   metrics += "\"dhtTemperature\": " + String(dhtTemperature, 2) + ",";
   metrics += "\"dhtHumiduty\": " + String(dhtHumidity, 2) + ",";
-  metrics += "\"heaterDuty\": " + String(heaterDuty, 2) + ",";
-  metrics += "\"fanDuty\": " + String(fanSpeed, 2) + ",";
+  metrics += "\"heaterDuty\": " + String(heaterOutput, 2) + ",";
+  metrics += "\"fanDuty\": " + String(fanOutput, 2) + ",";
   metrics += "\"targetTemperature\": " + String(targetTemperature, 2);
   metrics += "}";
 
@@ -261,11 +268,11 @@ void updateDisplay() {
   }
 
   // Draw 3D printer icon if connected to Moonraker
-  if (isConnected) {
+  if (webSocket.isConnected()) {
     display.drawXbm(0, 20, ICON_WIDTH, ICON_HEIGHT, printer_icon);
   }
 
-  if (isPrinting) {
+  if (webSocket.isConnected() && isPrinting) {
     display.drawXbm(0, 40, ICON_WIDTH, ICON_HEIGHT, printing_icon);
   }
 
@@ -290,7 +297,7 @@ void updateDisplay() {
   display.drawString(20, 30, chambTempText);
 
   String fanSpeedText = "Fan Speed: ";
-  fanSpeedText += fanSpeed;
+  fanSpeedText += fanOutput;
   fanSpeedText += " %";
   display.drawString(20, 40, fanSpeedText);
 
@@ -306,21 +313,25 @@ void updateDisplay() {
 }
 
 void onEventsCallback(WStype_t type, uint8_t * payload, size_t length) {
+  String payloadStr = "";
+      for (size_t i = 0; i < length; i++) {
+        payloadStr += (char)payload[i];
+      }
+      // Serial.print("Received message: ");
+      // Serial.println(payloadStr);
   switch (type) {
     case WStype_DISCONNECTED:
-      isConnected = false;
+      //isConnected = false;
       Serial.println("Disconnected from Moonraker");
       break;
     case WStype_CONNECTED:
       Serial.println("Connected to Moonraker");
-      isConnected = true;
+      //isConnected = true;
       subscribeMoonraker();
       break;
     case WStype_TEXT:
-      // Serial.print("Received message: ");
-      // Serial.println(message.data());
       JsonDocument doc;
-      deserializeJson(doc, payload);
+      deserializeJson(doc, payloadStr);
       // Status
       if (doc.containsKey("result") && doc["params"].containsKey("status") && doc["result"]["status"].containsKey("print_stats")) {
         String event = doc["result"]["status"]["print_stats"]["state"].as<String>();
@@ -449,6 +460,18 @@ void setup() {
   manualMode = preferences.getBool("manualMode", false);
   maxFanSpeed = preferences.getInt("maxFanSpeed", 100);
 
+  heaterPID.SetMode(AUTOMATIC);
+  heaterPID.SetOutputLimits(0, 255); // Set output limits for heater PWM
+  heaterPIDStr = preferences.getString("heaterPID", heaterPIDStr);
+  sscanf(heaterPIDStr.c_str(), "%lf,%lf,%lf", &Kp, &Ki, &Kd);
+  heaterPID.SetTunings(Kp, Ki, Kd);
+
+  fanPID.SetMode(AUTOMATIC);
+  fanPID.SetOutputLimits(0, 255); // Set output limits for fan PWM
+  fanPIDStr = preferences.getString("fanPID", fanPIDStr);
+  sscanf(fanPIDStr.c_str(), "%lf,%lf,%lf", &fanKp, &fanKi, &fanKd);
+  heaterPID.SetTunings(fanKp, fanKi, fanKd);
+
   delay(5000);
 
   // Initialize the web server
@@ -458,6 +481,7 @@ void setup() {
   server.on("/setMoonrakerConfig", handleSetMoonrakerConfig);
   server.on("/setTemperatureSource", handleSetTemperatureSource);
   server.on("/setManualMode", handleSetManualMode);
+  server.on("/setPID", handleSetPID);
   server.begin();
   Serial.println("HTTP server started");
 
@@ -468,39 +492,33 @@ void setup() {
   ledcAttachPin(FAN_PIN, 1);
 
   // Attempt initial connection to WebSocket
+  webSocket.setReconnectInterval(5000);
   webSocket.onEvent(onEventsCallback);
 
   // Start WebSocket server
   webSocketServer.begin();
   webSocketServer.onEvent(webSocketEvent);
 
-  // display.drawString(0, 20, "Socket server: " + webSocketServer.clientIsConnected()? "Yes" : "No");
-  // display.display();
-
-  //attemptConnection();
-  updatePWM();
-
   displayTicker.attach(1, updateDisplay);
   metricsTicker.attach(1, updateMetrics);
   temperatureTicker.attach(1, updateTempareture);
+  pwmTicker.attach(1, updatePWM);
 
-  display.drawString(0, 30, "Boot complete");
+  display.drawString(0, 20, "Boot complete");
   display.display();
 }
 
 void loop() {
   webSocketServer.loop();
+  webSocket.loop();
 
   // Handle web server requests
   server.handleClient();
 
-  if (isConnected) {
-    webSocket.loop();
-  }
-
   // Attempt to connect to WebSocket if not connected
   unsigned long currentTime = millis();
   if (!webSocket.isConnected() && currentTime - lastConnectionAttempt >= connectionInterval) {
+    Serial.println("Trying to connet to Moonraker");
     attemptConnection();
     lastConnectionAttempt = currentTime;
   }
@@ -517,9 +535,6 @@ void loop() {
     lastTachTime = currentTimeMicros;
     Serial.println("RPM pulses: " + String(pulses) + " Seconds passed:" + String(timeDiff/1000000));
   }
-
-  // Update PWM values based on temperature
-  updatePWM();
 }
 
 void handleRoot() {
@@ -529,6 +544,13 @@ void handleRoot() {
   html += "<p>Target Temperature: " + String(targetTemperature) + " &deg;C</p>";
   html += htmlMetrics;
   html += "</header>";
+  html += "<form action=\"/setPID\" method=\"post\">";
+  html += "  <label for=\"heaterPID\">Heater PID (Kp,Ki,Kd):</label><br>";
+  html += "  <input type=\"text\" id=\"heaterPID\" name=\"heaterPID\" value=\"" + String(heaterPIDStr) + "\"><br>";
+  html += "  <label for=\"fanPID\">Fan PID (Kp,Ki,Kd):</label><br>";
+  html += "  <input type=\"text\" id=\"fanPID\" name=\"fanPID\" value=\"" + String(fanPIDStr) + "\"><br>";
+  html += "  <input type=\"submit\" value=\"Submit\">";
+  html += "</form>";
   html += "<form action=\"/setMaxFanSpeed\" method=\"POST\">";
   html += "Set Max Fan Speed %: <input type=\"text\" name=\"maxFanSpeed\" value=\"" + String(maxFanSpeed) + "\"><br>";
   html += "<input type=\"submit\" value=\"Set\">";
@@ -587,6 +609,9 @@ void handleSetMoonrakerConfig() {
     preferences.putString("auth", moonrakerAuth);
     Serial.println("Moonraker IP set to: " + moonrakerIp);
     Serial.println("Moonraker Auth set to: " + moonrakerAuth);
+    if (webSocket.isConnected()) {
+      webSocket.disconnect();
+    }
     attemptConnection();
   }
   server.sendHeader("Location", "/");
@@ -615,6 +640,25 @@ void handleSetManualMode() {
   server.send(303);
 }
 
+void handleSetPID() {
+  if (server.hasArg("heaterPID") && server.hasArg("fanPID")) {
+    heaterPIDStr = server.arg("heaterPID");
+    fanPIDStr = server.arg("fanPID");
+
+    // Parse and set Heater PID values
+    sscanf(heaterPIDStr.c_str(), "%lf,%lf,%lf", &Kp, &Ki, &Kd);
+    heaterPID.SetTunings(Kp, Ki, Kd);
+    preferences.putString("heaterPID", heaterPIDStr);
+
+    // Parse and set Fan PID values
+    sscanf(fanPIDStr.c_str(), "%lf,%lf,%lf", &fanKp, &fanKi, &fanKi);
+    fanPID.SetTunings(fanKp, fanKi, fanKi);
+    preferences.putString("fanPID", fanPIDStr);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
 void updatePWM() {
 
   if (useDHT20) {
@@ -628,69 +672,30 @@ void updatePWM() {
     ledcWrite(0, 0);
     ledcWrite(1, 0);
     digitalWrite(FAN_POWER_PIN, HIGH);
+    Serial.println("Warning temperature limit reached");
     return;
   }
 
-  if (currentTemperature != 0.0 && currentTemperature < targetTemperature) {
-    fanStopTime = 0; // Reset fan stop time
-    if (currentTemperature < targetTemperature - fullLoadThreshold) {
-      // Temperature is much lower than target, full load
-      ledcWrite(0, PWM_HEATER_LIMIT);
-      digitalWrite(FAN_POWER_PIN, LOW);
-      // Fan speed
-      int currentFanSpeed = map(maxFanSpeed, 0, 100, 0, 255);
-      ledcWrite(1, currentFanSpeed);
-      fanSpeed = maxFanSpeed;
-      isFanRunning = true;
-    } else if (currentTemperature < targetTemperature - halfLoadThreshold) {
-      // Temperature is much lower than target, full load
-      ledcWrite(0, PWM_HEATER_LIMIT);
-      digitalWrite(FAN_POWER_PIN, LOW);
-      // Fan speed
-      int currentFanSpeed = map(maxFanSpeed, 0, 100, 0, 255);
-      ledcWrite(1, currentFanSpeed);
-      fanSpeed = maxFanSpeed;
-      isFanRunning = true;
-    } else {
-      // Temperature is closer to target, reduce heater power
-      float pwmValue = 255 * (targetTemperature - currentTemperature) / halfLoadThreshold;
-      pwmValue = constrain((int)pwmValue, 0, PWM_HEATER_LIMIT);
-      ledcWrite(0, pwmValue);
-      digitalWrite(FAN_POWER_PIN, LOW);
-      // Fan speed
-      int currentFanSpeed = map(maxFanSpeed, 0, 100, 0, 255);
-      ledcWrite(1, currentFanSpeed);
-      fanSpeed = maxFanSpeed;
-      isFanRunning = true;
-    }
+  // Primary PID control for heater
+  heaterPID.Compute();
+  Serial.println("Heater output: " + (String) heaterOutput);
+  ledcWrite(0, heaterOutput);
+
+  bool fanComputeResult = fanPID.Compute();
+  Serial.println("Fan compute: " + fanComputeResult? "Updated": "Failed");
+  Serial.println("Fan output: " + (String) fanOutput);
+  if (fanOutput == 0) {
+    digitalWrite(FAN_POWER_PIN, HIGH);
   } else {
-    // Target temperature reached, turn off heater and fan
-    ledcWrite(0, 0);
-    if (isFanRunning) {
-      // Set the time when the fan should stop
-      if (fanStopTime == 0) {
-        fanStopTime = millis();
-      }
-      // Check if 30 seconds have passed
-      if (millis() - fanStopTime >= 30000) {
-        ledcWrite(1, 0);
-        digitalWrite(FAN_POWER_PIN, HIGH);
-        fanSpeed = 0;
-        isFanRunning = false;
-      } else {
-        // Half speed
-        digitalWrite(FAN_POWER_PIN, LOW);
-        fanSpeed = 30;
-        int currentFanSpeed = map(fanSpeed, 0, 100, 0, 255);
-        ledcWrite(1, currentFanSpeed);
-        ledcWrite(1, 80);
-      }
-    }
+    digitalWrite(FAN_POWER_PIN, LOW);
   }
+  ledcWrite(1, fanOutput);
+
+  // ----------------------------------------
 }
 
 void subscribeMoonraker() {
-  if (isConnected) {
+  if (webSocket.isConnected()) {
     Serial.println("Subscribing");
     webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"print_stats\": [\"state\"]}},\"id\": 1}");
     webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"webhooks\": [\"gcode_response\"]}},\"id\": 2}");
@@ -701,13 +706,14 @@ void subscribeMoonraker() {
 }
 
 void attemptConnection() {
-  if (WiFi.status() == WL_CONNECTED && moonrakerIp != "") {
+  if (WiFi.status() == WL_CONNECTED && moonrakerIp != "" && !webSocket.isConnected()) {
     if (moonrakerAuth != "") {
       String auth = "Authorization: Bearer " + moonrakerAuth;
       webSocket.setExtraHeaders(auth.c_str());
     }
-    webSocket.begin(moonrakerIp.c_str(), (uint16_t) 7125, "/websocket");
-    lastConnectionAttempt = millis();
+    IPAddress addr = IPAddress();
+    addr.fromString(moonrakerIp);
+    webSocket.begin(addr, (uint16_t) 7125, "/websocket", "");
   } else {
     Serial.println("WiFi Disconnected or Moonraker IP not set");
   }
