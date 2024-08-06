@@ -2,7 +2,7 @@
 
 This project involves an ESP32 microcontroller controlling a PWM heater and fan, reading temperature and humidity from a DHT20 sensor, and integrating with a 3D printer via the Moonraker API using WebSockets. It includes a web interface for setting target temperatures and configuring the Moonraker API connection, and an OLED display for real-time monitoring.
 
-# Model assemby
+# Model assembly
 
 ![Heater Case](https://github.com/andsol/esp32-creality-chamber-heater/blob/main/media/heater-assembly.png)
 
