@@ -4,7 +4,7 @@ This project involves an ESP32 microcontroller controlling a PWM heater and fan,
 
 # Model assemby
 
-![Heater Case](https://github.com/andsol/esp32-creality-chamber-heater/media/heater-assembly.png)
+![Heater Case](https://github.com/andsol/esp32-creality-chamber-heater/tree/main/media/heater-assembly.png)
 
 ## Hardware Components:
 
