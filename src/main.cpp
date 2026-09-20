@@ -1,5 +1,6 @@
 
 #include <Arduino.h>
+#include <math.h>
 #include <Wire.h>
 #include "I2CScanner.h"
 #include "SSD1306Wire.h"
@@ -35,6 +36,17 @@ const float halfLoadThreshold = 5.0; // Temperature threshold for full load
 
 float dhtTemperature = 0.0;
 float dhtHumidity = 0.0;
+
+// 3V3 -- 47k resistor -- GPIO34 -- NTC 100k B3950 -- GND.
+// Place a 90-100 nF capacitor between GPIO34 and GND.
+constexpr uint8_t NTC_PIN = 34; // ADC1: usable while Wi-Fi is active.
+constexpr float NTC_SERIES_OHMS = 47000.0f;
+constexpr float NTC_NOMINAL_OHMS = 100000.0f;
+constexpr float NTC_BETA = 3950.0f;
+constexpr float NTC_SUPPLY_MV = 3300.0f; // Adjust to measured 3V3 for calibration.
+constexpr unsigned NTC_SAMPLES = 16;
+float ntcTemperature = NAN; // Monitoring only; not a heater safety input.
+
 
 float chamberTemperature = 0.0;
 double currentTemperature = 0.0;
@@ -117,6 +129,7 @@ const char* htmlMetrics = R"rawliteral(
   <div id="metrics">
     <div class="metric">Top Temperature: <span id="chamberTemperature">--</span> &deg;C</div>
     <div class="metric">Bottom Temperature: <span id="dhtTemperature">--</span> &deg;C</div>
+    <div class="metric">NTC Temperature: <span id="ntcTemperature">--</span> &deg;C</div>
     <div class="metric">Bottom Humidity: <span id="dhtHumiduty">--</span> %</div>
     <div class="metric">Heater Duty: <span id="heaterDuty">--</span> %</div>
     <div class="metric">Fan Duty: <span id="fanDuty">--</span> %</div>
@@ -168,6 +181,13 @@ const char* htmlMetrics = R"rawliteral(
             borderColor: '#cc65fe',
             data: [],
             fill: false,
+          },
+          {
+            label: 'NTC Temperature (C)',
+            borderColor: '#228b22',
+            data: [],
+            fill: false,
+            spanGaps: false,
           }
         ]
       },
@@ -202,6 +222,8 @@ const char* htmlMetrics = R"rawliteral(
 
     socket.onmessage = function(event) {
       const metrics = JSON.parse(event.data);
+      const ntc = Number.isFinite(metrics.ntcTemperature) ? metrics.ntcTemperature : null;
+      document.getElementById('ntcTemperature').innerText = ntc === null ? 'Sensor error' : ntc.toFixed(2);
       document.getElementById('chamberTemperature').innerText = metrics.chamberTemperature;
       document.getElementById('dhtTemperature').innerText = metrics.dhtTemperature;
       document.getElementById('dhtHumiduty').innerText = metrics.dhtHumiduty;
@@ -215,6 +237,7 @@ const char* htmlMetrics = R"rawliteral(
       temperatureChart.data.datasets[3].data.push({x: Date.now(), y: metrics.heaterDuty});
       temperatureChart.data.datasets[4].data.push({x: Date.now(), y: metrics.fanDuty});
       temperatureChart.data.datasets[5].data.push({x: Date.now(), y: metrics.targetTemperature});
+      temperatureChart.data.datasets[6].data.push({x: Date.now(), y: ntc});
       temperatureChart.update('quiet');
     };
 
@@ -244,14 +267,23 @@ void IRAM_ATTR tachISR() {
   tachCounter++;
 }
 
+// Report the applied PWM duty, including zero after a protection shutdown.
+float pwmDutyPercent(uint8_t channel) {
+  constexpr uint32_t maxDuty = (1UL << PWM_RESOLUTION) - 1;
+  const uint32_t duty = ledcRead(channel);
+  return 100.0f * (duty > maxDuty ? maxDuty : duty) / maxDuty;
+}
+
 void updateMetrics() {
+  const float ntc = ntcTemperature;
   // Prepare metrics JSON
   String metrics = "{";
   metrics += "\"chamberTemperature\": " + String(chamberTemperature, 2) + ",";
   metrics += "\"dhtTemperature\": " + String(dhtTemperature, 2) + ",";
   metrics += "\"dhtHumiduty\": " + String(dhtHumidity, 2) + ",";
-  metrics += "\"heaterDuty\": " + String(heaterOutput, 2) + ",";
-  metrics += "\"fanDuty\": " + String(fanOutput, 2) + ",";
+  metrics += "\"heaterDuty\": " + String(pwmDutyPercent(0), 2) + ",";
+  metrics += "\"fanDuty\": " + String(pwmDutyPercent(1), 2) + ",";
+  metrics += "\"ntcTemperature\": " + (isfinite(ntc) ? String(ntc, 2) : String("null")) + ",";
   metrics += "\"targetTemperature\": " + String(targetTemperature, 2);
   metrics += "}";
 
@@ -297,7 +329,7 @@ void updateDisplay() {
   display.drawString(20, 30, chambTempText);
 
   String fanSpeedText = "Fan Speed: ";
-  fanSpeedText += fanOutput;
+  fanSpeedText += String(pwmDutyPercent(1), 1);
   fanSpeedText += " %";
   display.drawString(20, 40, fanSpeedText);
 
@@ -310,6 +342,18 @@ void updateDisplay() {
   display.drawString(20, 50, currentFanRpm);
 
   display.display();
+}
+
+// Replies contain a snapshot; notifications contain only changed fields.
+void updateMoonrakerStatus(JsonObjectConst status) {
+  JsonVariantConst state = status["print_stats"]["state"];
+  if (state.is<const char*>()) {
+    isPrinting = (strcmp(state.as<const char*>(), "printing") == 0);
+  }
+  JsonVariantConst temperature = status["temperature_sensor chamber_temp"]["temperature"];
+  if (temperature.is<float>()) {
+    chamberTemperature = temperature.as<float>();
+  }
 }
 
 void onEventsCallback(WStype_t type, uint8_t * payload, size_t length) {
@@ -331,26 +375,21 @@ void onEventsCallback(WStype_t type, uint8_t * payload, size_t length) {
       break;
     case WStype_TEXT:
       JsonDocument doc;
-      deserializeJson(doc, payloadStr);
-      // Status
-      if (doc.containsKey("result") && doc["params"].containsKey("status") && doc["result"]["status"].containsKey("print_stats")) {
-        String event = doc["result"]["status"]["print_stats"]["state"].as<String>();
-        if (event == "printing") {
-          isPrinting = true;
-        } else {
-          isPrinting = false;
-        }
-      } else if (doc.containsKey("params") && doc.containsKey("method") && doc["method"] == "notify_status_update"
-        && doc["params"].is<JsonArray>() && doc["params"].size() > 0) {
-        // Iterate through the "params" array
-        for (JsonVariant value : doc["params"].as<JsonArray>()) {
-          // Check if the current element contains the key
-          if (value.is<JsonObject>() && value.containsKey("temperature_sensor chamber_temp")) {
-            // Extract the temperature value
-            chamberTemperature = (float) value["temperature_sensor chamber_temp"]["temperature"];
-            continue;
-          }
-        }
+      if (deserializeJson(doc, payloadStr)) {
+        Serial.println("Invalid Moonraker JSON");
+        break;
+      }
+      if (doc["error"].is<JsonObject>()) {
+        Serial.print("Moonraker RPC error: ");
+        serializeJson(doc["error"], Serial);
+        Serial.println();
+        break;
+      }
+      if (doc["result"]["status"].is<JsonObject>()) {
+        updateMoonrakerStatus(doc["result"]["status"].as<JsonObjectConst>());
+      } else if (doc["method"] == "notify_status_update"
+          && doc["params"][0].is<JsonObject>()) {
+        updateMoonrakerStatus(doc["params"][0].as<JsonObjectConst>());
       } else if (doc.containsKey("method") && doc.containsKey("params") && doc["method"] == "notify_gcode_response"
           && doc["params"].is<JsonArray>() && doc["params"].size() > 0) {
         Serial.println("Found gCode history");
@@ -399,7 +438,25 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
 
 }
 
+float readNtcTemperature() {
+    uint32_t sumMv = 0;
+    for (unsigned i = 0; i < NTC_SAMPLES; ++i) {
+        sumMv += analogReadMilliVolts(NTC_PIN);
+    }
+    const float mv = sumMv / static_cast<float>(NTC_SAMPLES);
+    // Reject short/open circuits and readings outside the useful ADC range.
+    // These are measurement limits, not safe heater temperature limits.
+    if (mv < 150.0f || mv > 2450.0f || mv >= NTC_SUPPLY_MV) return NAN;
+    const float resistance = NTC_SERIES_OHMS * mv / (NTC_SUPPLY_MV - mv);
+    const float inverseKelvin = 1.0f / 298.15f
+        + logf(resistance / NTC_NOMINAL_OHMS) / NTC_BETA;
+    if (!isfinite(inverseKelvin) || inverseKelvin <= 0.0f) return NAN;
+    const float temperature = 1.0f / inverseKelvin - 273.15f;
+    return isfinite(temperature) ? temperature : NAN;
+}
+
 void updateTempareture() {
+    ntcTemperature = readNtcTemperature();
     dht.read(); // Read values from DHT20
     dhtTemperature = dht.getTemperature();
     dhtHumidity = dht.getHumidity();
@@ -409,6 +466,10 @@ void updateTempareture() {
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
+
+  pinMode(NTC_PIN, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(NTC_PIN, ADC_11db);
 
   pinMode(FAN_POWER_PIN, OUTPUT);
   // Initially turn off the LM2596 module
@@ -539,7 +600,7 @@ void loop() {
 
 void handleRoot() {
   String html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><link rel=\"stylesheet\" href=\"https://cdn.simplecss.org/simple.min.css\">";
-  html += "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script><script src=\"https://cdn.jsdelivr.net/npm/luxon\"></script><script src=\"https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon\"></script><script src=\"https://cdn.jsdelivr.net/npm/chartjs-plugin-streaming\"></script></head><body>";
+  html += "<script src=\"https://cdn.jsdelivr.net/npm/chart.js@3.9.1\"></script><script src=\"https://cdn.jsdelivr.net/npm/luxon\"></script><script src=\"https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon\"></script><script src=\"https://cdn.jsdelivr.net/npm/chartjs-plugin-streaming@2.0.0\"></script></head><body>";
   html += "<header><h1>Moonraker chamber Heater Control</h1>";
   html += "<p>Target Temperature: " + String(targetTemperature) + " &deg;C</p>";
   html += htmlMetrics;
@@ -697,9 +758,8 @@ void updatePWM() {
 void subscribeMoonraker() {
   if (webSocket.isConnected()) {
     Serial.println("Subscribing");
-    webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"print_stats\": [\"state\"]}},\"id\": 1}");
-    webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"webhooks\": [\"gcode_response\"]}},\"id\": 2}");
-    webSocket.sendTXT("{\"jsonrpc\": \"2.0\",\"method\": \"printer.objects.subscribe\",\"params\": {\"objects\": {\"temperature_sensor chamber_temp\": [\"temperature\"]}},\"id\": 3}");
+    // A new request replaces the subscription. G-code responses need no subscription.
+    webSocket.sendTXT("{\"jsonrpc\":\"2.0\",\"method\":\"printer.objects.subscribe\",\"params\":{\"objects\":{\"print_stats\":[\"state\"],\"temperature_sensor chamber_temp\":[\"temperature\"]}},\"id\":1}");
   } else {
     Serial.println("WiFi Disconnected or Moonraker IP not set");
   }
