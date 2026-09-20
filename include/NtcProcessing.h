@@ -43,7 +43,7 @@ public:
         if (count < 60) return false;
         const auto n = std::minmax_element(radiator, radiator + 60);
         const auto d = std::minmax_element(air, air + 60);
-        return *n.second - *n.first <= 2.0f && *d.second - *d.first <= 0.5f;
+        return *n.second - *n.first <= 4.0f && *d.second - *d.first <= 0.5f;
     }
     float offset() const {
         if (!ready()) return NAN;

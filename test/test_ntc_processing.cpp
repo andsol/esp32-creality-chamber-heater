@@ -21,7 +21,11 @@ int main() {
     assert(!reference.ready() && std::isnan(reference.offset()));
     reference.add(33, 29.7f, true);
     assert(reference.ready() && std::fabs(reference.offset() + 3.3f) < 0.001f);
-    reference.add(36, 29.7f, true);
+    reference.add(36.06f, 29.7f, true);
+    assert(reference.ready()); // The observed 3.06 C noise is accepted.
+    reference.add(37, 29.7f, true);
+    assert(reference.ready()); // Inclusive 4 C limit.
+    reference.add(37.01f, 29.7f, true);
     assert(!reference.ready());
     for (int i = 0; i < 60; ++i) reference.add(33, 29.7f, true);
     assert(reference.ready());

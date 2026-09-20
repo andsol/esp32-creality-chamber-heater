@@ -172,7 +172,7 @@ String ntcCalibrationStatus() {
     return "Collecting measurements: " + String(ntcReference.sampleCount()) + "/60";
   if (!ntcReference.ready())
     return "Waiting for stable readings. NTC variation: " + String(ntcReference.ntcSpread(), 2) +
-      " C (max 2.00 C); DHT20 variation: " + String(ntcReference.dhtSpread(), 2) + " C (max 0.50 C)";
+      " C (max 4.00 C); DHT20 variation: " + String(ntcReference.dhtSpread(), 2) + " C (max 0.50 C)";
   return "ready";
 }
 

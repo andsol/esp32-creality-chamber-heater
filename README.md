@@ -198,7 +198,7 @@ Open **NTC calibration** in the web interface after stopping heating and letting
 the entire assembly reach room temperature. The radiator and DHT20 must be at
 the same physical temperature; stable readings alone do not establish this.
 The controller requires 60 consecutive valid samples with heat off, with NTC
-spread <=2 C and DHT20 spread <=0.5 C. The measurement counter (0/60) and readiness update live. At 60/60, the window
+spread <=4 C and DHT20 spread <=0.5 C. The measurement counter (0/60) and readiness update live. At 60/60, the window
 continues updating until the readings are stable. To calibrate,
 confirm thermal equilibrium, then select **Calibrate NTC to DHT20**.
 The correction is the average DHT20 minus uncorrected filtered NTC, limited to
